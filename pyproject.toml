@@ -1,14 +1,13 @@
 [project]
-name = "sa3-mlx"
+name = "sa3-inpainter-ui"
 version = "0.1.0"
-description = "Add your description here"
+description = "SA3 audio inpainting UI — CUDA port"
 requires-python = ">=3.11"
 dependencies = [
     "einops>=0.8.2",
     "fastapi>=0.136.1",
     "huggingface-hub>=1.15.0",
     "matplotlib>=3.10.9",
-    "mlx>=0.31.2",
     "numpy>=2.4.6",
     "psutil>=7.2.2",
     "python-multipart>=0.0.29",
@@ -16,8 +15,23 @@ dependencies = [
     "scipy>=1.17.1",
     "sentencepiece>=0.2.1",
     "soundfile>=0.13.1",
-    "torch>=2.12.0",
-    "torchaudio>=2.11.0",
-    "transformers>=5.9.0",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "transformers>=5.8.0",
     "uvicorn>=0.47.0",
+    "stable-audio-3",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+stable-audio-3 = { path = "../stable-audio-3", editable = true }
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchaudio = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]

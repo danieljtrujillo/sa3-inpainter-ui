@@ -171,7 +171,7 @@ async function pollStats() {
       ram: Math.round(j.ram_used / j.ram_total * 100),
       ramUsedGb: j.ram_used,
       ramTotalGb: j.ram_total,
-      mpsAllocGb: j.mps_alloc,
+      gpuAllocGb: j.gpu_alloc,
     };
     session.modelLoaded = j.model_loaded;
   } catch (e) {

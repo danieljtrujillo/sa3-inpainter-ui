@@ -57,8 +57,8 @@ function togglePlay() {
         <div class="bar"><div class="bar-fill" style="width:{session.stats.cpu ?? 0}%"></div></div>
       </div>
       <div class="stat">
-        <span class="stat-label">MPS</span><span class="stat-value">{(session.stats.mpsAllocGb ?? 0).toFixed(1)} GB</span>
-        <div class="bar"><div class="bar-fill" style="width:{Math.min(100, (session.stats.mpsAllocGb ?? 0) / 8 * 100)}%"></div></div>
+        <span class="stat-label">GPU</span><span class="stat-value">{(session.stats.gpuAllocGb ?? 0).toFixed(1)} GB</span>
+        <div class="bar"><div class="bar-fill" style="width:{Math.min(100, (session.stats.gpuAllocGb ?? 0) / 24 * 100)}%"></div></div>
       </div>
       <div class="stat">
         <span class="stat-label">RAM</span><span class="stat-value">{(session.stats.ramUsedGb ?? 0).toFixed(1)}/{(session.stats.ramTotalGb ?? 0).toFixed(0)}</span>

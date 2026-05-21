@@ -2,6 +2,8 @@
 
 Loads the SA3 medium model once at startup (~30s), exposes JSON API for the
 Svelte frontend.
+
+CUDA port: uses SA3's built-in torch autoencoder instead of the MLX AE.
 """
 import os, sys, json, time, warnings
 from pathlib import Path
@@ -11,10 +13,6 @@ os.environ.setdefault("PYTHONWARNINGS", "ignore")
 import numpy as np
 import torch
 import soundfile as sf
-import mlx.core as mx
-
-sys.path.insert(0, str(Path.home() / "Projects/sa3-mlx"))
-sys.path.insert(0, str(Path.home() / "Projects/stable-audio-3/stable-audio-3-repo"))
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
@@ -23,10 +21,9 @@ from pydantic import BaseModel
 from stable_audio_3.factory import create_diffusion_cond_from_config
 from stable_audio_3 import StableAudioModel
 from safetensors.torch import load_file
-from mlx_sa3.ae import SA3MediumAE, decode_chunked
-from mlx_sa3.weights import load_ae_weights
 
-LOCAL_MEDIUM = "/Users/lyra/Projects/stable-audio-3/models/stable-audio-3-medium"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+LOCAL_MEDIUM = os.environ.get("SA3_MODEL_DIR", str(Path.home() / "models/stable-audio-3-medium"))
 CKPT = f"{LOCAL_MEDIUM}/model.safetensors"
 CFG  = f"{LOCAL_MEDIUM}/model_config.json"
 DATA_DIR = Path("/tmp/sa3-inpainter"); DATA_DIR.mkdir(exist_ok=True)
@@ -34,21 +31,18 @@ SR = 44100
 DOWNSAMPLE = 4096
 BANDS = [(0, 250), (250, 2500), (2500, 22050)]
 
-print("[backend] loading sa3 medium on MPS...")
+print(f"[backend] loading sa3 medium on {DEVICE}...")
 _cfg = json.load(open(CFG))
 for c in _cfg["model"]["conditioning"]["configs"]:
     if c["type"] == "t5gemma":
         c["config"]["repo_id"] = LOCAL_MEDIUM
 _model = create_diffusion_cond_from_config(_cfg)
 _model.load_state_dict(load_file(CKPT), strict=False)
-_model.eval().requires_grad_(False).to("mps")
-sa = StableAudioModel(_model, _cfg, device="mps", model_half=False)
-print("[backend] loading MLX AE...")
-mlx_ae = SA3MediumAE()
-load_ae_weights(mlx_ae, CKPT)
+_model.eval().requires_grad_(False).to(DEVICE)
+sa = StableAudioModel(_model, _cfg, device=DEVICE, model_half=False)
+print("[backend] model loaded")
 
 
-# defined after helpers below; called at bottom of file
 def render_noise_spec_once():
     """Decode 30s of random latents into a noise spectrogram for the slider preview overlay."""
     out_path = DATA_DIR / "noise_spec.png"
@@ -56,9 +50,10 @@ def render_noise_spec_once():
     T_lat = int(30 * SR / DOWNSAMPLE) + 1
     rng = np.random.default_rng(7)
     lat = rng.standard_normal((1, 256, T_lat)).astype(np.float32) * 0.3
-    wav = mlx_ae.decode(mx.array(lat))
-    mx.eval(wav)
-    wav_np = np.array(wav)[0]
+    lat_t = torch.from_numpy(lat).to(DEVICE)
+    with torch.inference_mode():
+        wav_t = sa.decode(lat_t, chunked=True)
+    wav_np = wav_t.cpu().numpy()[0]
     render_spec_png(wav_np, out_path)
 
 state = {"audio_path": None, "version": 0}
@@ -88,8 +83,6 @@ def render_spec_png(audio_np, out_path):
     import matplotlib.pyplot as plt
     from scipy.signal import stft
     mono = audio_np.mean(axis=0) if audio_np.ndim == 2 else audio_np
-    # one STFT column per latent so spec time-axis quantizes to the same grid
-    # the waveform uses
     n_fft = 8192
     hop = DOWNSAMPLE
     f, t, Z = stft(mono, fs=SR, nperseg=n_fft, noverlap=n_fft - hop, boundary=None, padded=False)
@@ -129,8 +122,6 @@ def render_overview_png(audio_np, out_path, W=2000, H=80):
 
 
 def soft_limit(x, ceiling=0.97, knee=0.85):
-    """Soft saturator: linear below `knee`, smoothly compressed up to `ceiling`.
-    Cheap and clip-free even when the model returns peaks above 1.0."""
     s = np.sign(x)
     a = np.abs(x)
     out = np.where(
@@ -142,9 +133,7 @@ def soft_limit(x, ceiling=0.97, knee=0.85):
 
 
 def persist_audio(audio_np):
-    """audio_np: (2, T) float in [-1, 1]. Writes wav + envelope.json + spec.png + overview.png.
-    Caller is responsible for limiting/scaling — we don't touch the levels here so
-    inpaint-preserved regions stay bit-exact with the source."""
+    """audio_np: (2, T) float in [-1, 1]. Writes wav + envelope.json + spec.png + overview.png."""
     p = DATA_DIR / "current.wav"
     sf.write(p, audio_np.T, SR)
     state["audio_path"] = str(p)
@@ -197,27 +186,24 @@ async def generate(body: GenBody):
     kwargs = dict(prompt=body.prompt, steps=steps, cfg_scale=cfg, seed=seed, return_latents=True)
     if has_source and has_mask:
         audio, _ = sf.read(state["audio_path"])
-        audio_t = torch.from_numpy(audio.T).float().to("mps")   # (channels, T) — no batch dim
-        # align mask length to the actual latent count of the loaded audio.
-        # frontend's mask may be stale (different count from earlier session state).
+        audio_t = torch.from_numpy(audio.T).float().to(DEVICE)
         actual_lat = audio.shape[0] // DOWNSAMPLE
         mask_lat = np.asarray(body.mask, dtype=np.float32)
         if len(mask_lat) > actual_lat:
             mask_lat = mask_lat[:actual_lat]
         elif len(mask_lat) < actual_lat:
             mask_lat = np.pad(mask_lat, (0, actual_lat - len(mask_lat)), constant_values=0)
-        # mask: 1=regen, 0=preserve. sa3 convention: 1=preserve, 0=regen. invert.
         inv = 1.0 - mask_lat
         audio_mask = np.repeat(inv, DOWNSAMPLE)
         audio_mask = audio_mask[:audio.shape[0]]
         print(f"[inpaint] mask aligned: {len(mask_lat)} latents, {int(mask_lat.sum())} regen, {audio.shape[0]} samples")
         kwargs["duration"] = audio.shape[0] / SR
-        kwargs["sample_size"] = audio.shape[0]   # cap output to actual source length, not sa3's default 120s
+        kwargs["sample_size"] = audio.shape[0]
         kwargs["inpaint_audio"] = (SR, audio_t)
-        kwargs["inpaint_mask"] = torch.from_numpy(audio_mask).unsqueeze(0).to("mps")
+        kwargs["inpaint_mask"] = torch.from_numpy(audio_mask).unsqueeze(0).to(DEVICE)
     elif has_source:
         audio, _ = sf.read(state["audio_path"])
-        audio_t = torch.from_numpy(audio.T).float().to("mps")
+        audio_t = torch.from_numpy(audio.T).float().to(DEVICE)
         kwargs["duration"] = audio.shape[0] / SR
         kwargs["sample_size"] = audio.shape[0]
         kwargs["init_audio"] = (SR, audio_t)
@@ -230,38 +216,32 @@ async def generate(body: GenBody):
     latents = sa.generate(**kwargs)
     lat_np = latents.detach().to(torch.float32).cpu().numpy()
     print(f"[backend] DIT {time.time()-t0:.1f}s, latents shape {lat_np.shape}")
-    t1 = time.time()
-    if lat_np.shape[-1] > 128:
-        wav_m = decode_chunked(mlx_ae, mx.array(lat_np), chunk_size=128, overlap=32)
-    else:
-        wav_m = mlx_ae.decode(mx.array(lat_np))
-    mx.eval(wav_m)
-    print(f"[backend] AE {time.time()-t1:.1f}s")
-    wav_np = np.array(wav_m)[0]   # (2, T) — raw, no limiter (visual cap handled in frontend)
 
-    # sa3 pads internally to a power-of-2 latent count → output is longer than requested.
+    t1 = time.time()
+    lat_t = torch.from_numpy(lat_np).to(DEVICE)
+    with torch.inference_mode():
+        use_chunked = lat_np.shape[-1] > 128
+        wav_t = sa.decode(lat_t, chunked=use_chunked, chunk_size=128, overlap=32)
+    wav_np = wav_t.cpu().numpy()[0]
+    print(f"[backend] AE {time.time()-t1:.1f}s")
+
     target_dur = float(kwargs.get("duration", duration))
     max_samples = int(target_dur * SR)
     print(f"[truncate] mode={'inpaint' if (has_source and has_mask) else 'vary' if has_source else 't2a'} target_dur={target_dur:.2f}s max_samples={max_samples} wav_len={wav_np.shape[-1]}")
     if wav_np.shape[-1] > max_samples:
         wav_np = wav_np[:, :max_samples]
 
-    # inpaint mode: stitch — preserve the original audio at unmasked sample positions
-    # so unmasked regions are bit-exact, not lossily reconstructed by the AE+DIT
     if has_source and has_mask:
         orig, _ = sf.read(state["audio_path"])
-        orig_t = orig.T   # (2, T)
+        orig_t = orig.T
         if orig_t.ndim == 1:
             orig_t = np.stack([orig_t, orig_t], axis=0)
-        # align to the smallest of (orig audio, generated wav, mask) so shapes match exactly
         T = min(orig_t.shape[-1], wav_np.shape[-1], len(audio_mask))
-        m = audio_mask[:T].astype(np.float32)        # 1=preserve, 0=regen
+        m = audio_mask[:T].astype(np.float32)
         m2 = np.stack([m, m], axis=0)
         wav_np = wav_np[:, :T]
         orig_t = orig_t[:, :T]
-        # short cosine crossfade across boundaries to avoid clicks
-        # (boundaries detected as positions where mask transitions)
-        XF = 256   # samples
+        XF = 256
         m_eased = m2.copy()
         edges = np.where(np.abs(np.diff(m)) > 0)[0]
         for e in edges:
@@ -269,7 +249,6 @@ async def generate(body: GenBody):
             hi = min(T, e + XF // 2)
             w = np.linspace(0, 1, hi - lo)
             if m[e] > m[e + 1] if e + 1 < T else False:
-                # going from preserve(1) to regen(0): fade preserve out
                 m_eased[:, lo:hi] = np.minimum(m_eased[:, lo:hi], 1 - w)
             else:
                 m_eased[:, lo:hi] = np.maximum(m_eased[:, lo:hi], w)
@@ -294,7 +273,7 @@ async def get_state():
 
 import psutil
 _proc = psutil.Process()
-psutil.cpu_percent(interval=None)  # prime
+psutil.cpu_percent(interval=None)
 LORA_DIR = Path(os.environ.get("SA3_LORA_DIR", str(Path.home() / "loras")))
 
 @app.get("/api/loras")
@@ -310,16 +289,16 @@ async def get_stats():
     vm = psutil.virtual_memory()
     ram_used_gb = (vm.total - vm.available) / 1e9
     ram_total_gb = vm.total / 1e9
-    mps_alloc_gb = 0.0
+    gpu_alloc_gb = 0.0
     try:
-        if torch.backends.mps.is_available():
-            mps_alloc_gb = torch.mps.current_allocated_memory() / 1e9
+        if torch.cuda.is_available():
+            gpu_alloc_gb = torch.cuda.memory_allocated() / 1e9
     except Exception: pass
     return {
         "cpu": round(cpu, 1),
         "ram_used": round(ram_used_gb, 1),
         "ram_total": round(ram_total_gb, 1),
-        "mps_alloc": round(mps_alloc_gb, 2),
+        "gpu_alloc": round(gpu_alloc_gb, 2),
         "model_loaded": True,
     }
 
