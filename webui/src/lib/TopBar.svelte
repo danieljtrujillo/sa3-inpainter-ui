@@ -17,6 +17,18 @@ async function onNew() {
 function onClear() {
   session.clearMask();
 }
+
+async function onDownload() {
+  if (!session.hasAudio) return;
+  const r = await fetch(`/api/audio?v=${session.version}`);
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `sa3-inpaint-${Date.now()}.wav`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 </script>
 
 <header class="topbar">
@@ -33,6 +45,9 @@ function onClear() {
     </button>
     <button class="btn btn-ghost" onclick={onClear}>
       <i class="bi bi-x-lg"></i> Clear
+    </button>
+    <button class="btn btn-ghost" onclick={onDownload} disabled={!session.hasAudio}>
+      <i class="bi bi-download"></i> Export
     </button>
     <input type="file" accept="audio/*,.wav,.mp3,.flac"
            bind:this={fileInput} onchange={onFile} style="display: none" />

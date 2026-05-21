@@ -1,3 +1,5 @@
+import { toasts } from "./toast.svelte.js";
+
 // Shared reactive session state.
 
 function maskToRanges(mask) {
@@ -102,13 +104,21 @@ class Session {
   }
 
   _maskHistory = [];
+  _maskRedoStack = [];
   _pushMaskHistory() {
     this._maskHistory.push(new Uint8Array(this.mask));
     if (this._maskHistory.length > 50) this._maskHistory.shift();
+    this._maskRedoStack = [];
   }
   undoMask() {
     if (this._maskHistory.length === 0) return;
+    this._maskRedoStack.push(new Uint8Array(this.mask));
     this.mask = this._maskHistory.pop();
+  }
+  redoMask() {
+    if (this._maskRedoStack.length === 0) return;
+    this._maskHistory.push(new Uint8Array(this.mask));
+    this.mask = this._maskRedoStack.pop();
   }
 
   paint(startLatent, endLatent, mode) {
@@ -142,16 +152,20 @@ export async function apiState() {
 }
 
 export async function apiUpload(file) {
-  const fd = new FormData();
-  fd.append("file", file);
-  const r = await fetch("/api/upload", { method: "POST", body: fd });
-  if (!r.ok) throw new Error("upload failed: " + r.status);
-  const j = await r.json();
-  session.hasAudio = true;
-  session.version = j.version;
-  session.setTrackInfo(j);
-  session.duration = Math.round(j.duration); // sync length slider to the loaded sample
-  return j;
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch("/api/upload", { method: "POST", body: fd });
+    if (!r.ok) throw new Error("upload failed: " + r.status);
+    const j = await r.json();
+    session.hasAudio = true;
+    session.version = j.version;
+    session.setTrackInfo(j);
+    session.duration = Math.round(j.duration); // sync length slider to the loaded sample
+    return j;
+  } catch (e) {
+    toasts.error("Upload failed: " + e.message);
+  }
 }
 
 export async function apiClear() {
@@ -212,10 +226,11 @@ export async function apiGenerate() {
       session.ghostMask = new Uint8Array(body.mask);
     }
     session.mask = new Uint8Array(session.mask.length);
+    toasts.success("Generation complete");
     return j;
   } catch (e) {
     if (e.name === "AbortError") return null;
-    throw e;
+    toasts.error("Generate failed: " + e.message);
   } finally {
     _genAbort = null;
     session.generating = false;

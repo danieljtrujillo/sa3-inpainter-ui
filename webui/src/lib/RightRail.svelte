@@ -70,12 +70,12 @@ async function setPrecision(e) {
 
 async function rerollGenerate() {
   rerollSeed();
-  try { await apiGenerate(); } catch (e) { console.error(e); alert("generate failed: " + e.message); }
+  try { await apiGenerate(); } catch (e) { console.error(e); }
 }
 
 async function clickGenerate() {
   if (session.generating) { cancelGenerate(); return; }
-  try { await apiGenerate(); } catch (e) { console.error(e); alert("generate failed: " + e.message); }
+  try { await apiGenerate(); } catch (e) { console.error(e); }
 }
 </script>
 
@@ -83,7 +83,7 @@ async function clickGenerate() {
 
   <section class="prompt-section">
     <header class="section-header"><span>Prompt</span></header>
-    <textarea class="prompt-input" bind:value={session.prompt}></textarea>
+    <textarea class="prompt-input" bind:value={session.prompt} maxlength="500"></textarea>
     <div class="prompt-meta">
       <span class="text-muted">{promptCharCount} / 500</span>
       <button class="link" onclick={() => session.prompt = ""}>Clear</button>

@@ -7,6 +7,7 @@ import TimeAxis from "./lib/TimeAxis.svelte";
 import MainCanvas from "./lib/MainCanvas.svelte";
 import RightRail from "./lib/RightRail.svelte";
 import BottomBar from "./lib/BottomBar.svelte";
+import Toast from "./lib/Toast.svelte";
 
 let audioEl = $state(null);
 let isDragOver = $state(false);
@@ -56,6 +57,9 @@ function onKeyDown(e) {
     e.preventDefault();
     session.seed = Math.floor(Math.random() * 1000000);
     apiGenerate().catch(console.error);
+  } else if (mod && e.shiftKey && e.key === "Z") {
+    e.preventDefault();
+    session.redoMask();
   } else if (mod && e.key === "z") {
     e.preventDefault();
     session.undoMask();
@@ -139,7 +143,14 @@ $effect(() => {
   }
 });
 
-function onAudioEnded() { session.playing = false; }
+function onAudioEnded() {
+  if (session.looping) {
+    audioEl.currentTime = 0;
+    audioEl.play().catch(() => {});
+  } else {
+    session.playing = false;
+  }
+}
 
 // smooth playhead + filter ducking inside masked regions
 let rafHandle = 0;
@@ -252,6 +263,8 @@ onMount(() => {
   {#if isDragOver}
     <div class="drop-overlay">drop audio file to load</div>
   {/if}
+
+  <Toast />
 </div>
 
 <audio
