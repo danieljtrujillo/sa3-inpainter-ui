@@ -1,6 +1,6 @@
 <script>
 import { onMount } from "svelte";
-import { session, apiState, apiUpload } from "./lib/session.svelte.js";
+import { session, apiState, apiUpload, apiGenerate } from "./lib/session.svelte.js";
 import TopBar from "./lib/TopBar.svelte";
 import OverviewWave from "./lib/OverviewWave.svelte";
 import TimeAxis from "./lib/TimeAxis.svelte";
@@ -40,6 +40,7 @@ function ensureAudioGraph() {
 function onKeyDown(e) {
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  const mod = e.ctrlKey || e.metaKey;
   if (e.code === "Space") {
     e.preventDefault();
     session.playing = !session.playing;
@@ -48,6 +49,32 @@ function onKeyDown(e) {
       e.preventDefault();
       session.clearMask();
     }
+  } else if (mod && e.key === "g") {
+    e.preventDefault();
+    apiGenerate().catch(console.error);
+  } else if (!mod && e.key === "r") {
+    e.preventDefault();
+    session.seed = Math.floor(Math.random() * 1000000);
+    apiGenerate().catch(console.error);
+  } else if (mod && e.key === "z") {
+    e.preventDefault();
+    session.undoMask();
+  } else if (mod && e.key === "a") {
+    e.preventDefault();
+    const N = session.latentCount;
+    if (N > 0) session.paint(0, N, "regen");
+  } else if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    const step = session.trackSeconds > 0
+      ? session.downsampleRatio / session.sampleRate / session.trackSeconds
+      : 0;
+    session.playhead = Math.max(0, session.playhead - step);
+  } else if (e.key === "ArrowRight") {
+    e.preventDefault();
+    const step = session.trackSeconds > 0
+      ? session.downsampleRatio / session.sampleRate / session.trackSeconds
+      : 0;
+    session.playhead = Math.min(1, session.playhead + step);
   }
 }
 

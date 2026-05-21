@@ -10,8 +10,12 @@ async function onFile(e) {
   fileInput.value = "";
 }
 
-async function onClear() {
+async function onNew() {
   await apiClear();
+}
+
+function onClear() {
+  session.clearMask();
 }
 </script>
 
@@ -24,7 +28,7 @@ async function onClear() {
     <button class="btn btn-ghost" onclick={() => fileInput.click()}>
       <i class="bi bi-folder2-open"></i> Load
     </button>
-    <button class="btn btn-ghost" onclick={onClear}>
+    <button class="btn btn-ghost" onclick={onNew}>
       <i class="bi bi-file-earmark-plus"></i> New
     </button>
     <button class="btn btn-ghost" onclick={onClear}>

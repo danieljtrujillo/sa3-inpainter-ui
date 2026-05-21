@@ -5,7 +5,10 @@ function maskToRanges(mask) {
   let start = -1;
   for (let i = 0; i < mask.length; i++) {
     if (mask[i] && start < 0) start = i;
-    else if (!mask[i] && start >= 0) { out.push([start, i]); start = -1; }
+    else if (!mask[i] && start >= 0) {
+      out.push([start, i]);
+      start = -1;
+    }
   }
   if (start >= 0) out.push([start, mask.length]);
   return out;
@@ -13,41 +16,44 @@ function maskToRanges(mask) {
 
 class Session {
   // track
-  trackSeconds    = $state(0);
-  sampleRate      = $state(44100);
+  trackSeconds = $state(0);
+  sampleRate = $state(44100);
   downsampleRatio = $state(4096);
 
   // backend session
-  version  = $state(0);     // bumped by backend on every change; bust caches
+  version = $state(0); // bumped by backend on every change; bust caches
   hasAudio = $state(false);
 
   // mask is the single source of truth for what's painted
   mask = $state(new Uint8Array(0));
-  ghostMask = $state(new Uint8Array(0));   // last-inpainted regions, for visual recall
+  ghostMask = $state(new Uint8Array(0)); // last-inpainted regions, for visual recall
 
   // zoom window over full track, normalized 0..1
   zoomStart = $state(0.0);
-  zoomEnd   = $state(1.0);
+  zoomEnd = $state(1.0);
 
   // playhead, normalized 0..1 of full track
   playhead = $state(0.0);
-  playing  = $state(false);
-  volume   = $state(0.7);    // 0..1
+  playing = $state(false);
+  looping = $state(false);
+  volume = $state(0.7); // 0..1
+  visMode = $state("spectrogram");
 
   // prompt + settings
   prompt = $state("");
-  model  = $state("Medium (ARC)");
-  steps  = $state(8);
-  cfg    = $state(1.0);
-  noise  = $state(0.65);
-  seed   = $state(-1);
-  duration = $state(190);  // text-to-audio length (sec)
+  negativePrompt = $state("");
+  model = $state("Medium (ARC)");
+  steps = $state(8);
+  cfg = $state(1.0);
+  noise = $state(0.65);
+  seed = $state(-1);
+  duration = $state(190); // text-to-audio length (sec)
 
   loras = $state([]);
 
-  generating  = $state(false);
-  scrubbingNoise = $state(false);  // true while the user is actively dragging the A2A slider
-  modelLoaded = $state(false);   // assume down until pollStats confirms otherwise
+  generating = $state(false);
+  scrubbingNoise = $state(false); // true while the user is actively dragging the A2A slider
+  modelLoaded = $state(false); // assume down until pollStats confirms otherwise
   stats = $state({ cpu: 0, vram: 0, ram: 0 });
 
   get latentCount() {
@@ -74,8 +80,20 @@ class Session {
     this.mask = next;
   }
 
+  _maskHistory = [];
+  _pushMaskHistory() {
+    this._maskHistory.push(new Uint8Array(this.mask));
+    if (this._maskHistory.length > 50) this._maskHistory.shift();
+  }
+  undoMask() {
+    if (this._maskHistory.length === 0) return;
+    this.mask = this._maskHistory.pop();
+  }
+
   paint(startLatent, endLatent, mode) {
-    if (endLatent < startLatent) [startLatent, endLatent] = [endLatent, startLatent];
+    this._pushMaskHistory();
+    if (endLatent < startLatent)
+      [startLatent, endLatent] = [endLatent, startLatent];
     startLatent = Math.max(0, Math.floor(startLatent));
     endLatent = Math.min(this.mask.length, Math.ceil(endLatent));
     if (endLatent <= startLatent) return;
@@ -91,7 +109,6 @@ class Session {
 }
 
 export const session = new Session();
-
 
 // ---------- backend api ----------
 
@@ -112,7 +129,7 @@ export async function apiUpload(file) {
   session.hasAudio = true;
   session.version = j.version;
   session.setTrackInfo(j);
-  session.duration = Math.round(j.duration);   // sync length slider to the loaded sample
+  session.duration = Math.round(j.duration); // sync length slider to the loaded sample
   return j;
 }
 
@@ -142,7 +159,13 @@ export async function apiGenerate() {
   try {
     const body = {
       prompt: session.prompt,
+      ...(session.negativePrompt
+        ? { negative_prompt: session.negativePrompt }
+        : {}),
       mask: Array.from(session.mask),
+      loras: session.loras
+        .filter((l) => l.enabled)
+        .map((l) => ({ name: l.name, strength: l.strength })),
       settings: {
         steps: session.steps,
         cfg: session.cfg,
@@ -163,7 +186,7 @@ export async function apiGenerate() {
     session.version = j.version;
     session.setTrackInfo(j);
     // remember the inpainted regions as ghost (visual recall), then clear the live mask
-    if (body.mask.some(v => v)) {
+    if (body.mask.some((v) => v)) {
       session.ghostMask = new Uint8Array(body.mask);
     }
     session.mask = new Uint8Array(session.mask.length);

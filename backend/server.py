@@ -5,7 +5,8 @@ Svelte frontend.
 
 CUDA port: uses SA3's built-in torch autoencoder instead of the MLX AE.
 """
-import os, sys, json, time, warnings
+import asyncio
+import os, sys, json, time, threading, warnings
 from pathlib import Path
 warnings.filterwarnings("ignore")
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
@@ -13,6 +14,8 @@ os.environ.setdefault("PYTHONWARNINGS", "ignore")
 import numpy as np
 import torch
 import soundfile as sf
+import matplotlib.pyplot as plt
+from scipy.signal import stft
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
@@ -39,8 +42,18 @@ for c in _cfg["model"]["conditioning"]["configs"]:
 _model = create_diffusion_cond_from_config(_cfg)
 _model.load_state_dict(load_file(CKPT), strict=False)
 _model.eval().requires_grad_(False).to(DEVICE)
-sa = StableAudioModel(_model, _cfg, device=DEVICE, model_half=False)
+
+# fp16 on CUDA if SA3_FP16=1 (or default True on CUDA)
+_use_fp16 = os.environ.get("SA3_FP16", "1" if DEVICE == "cuda" else "0") == "1"
+if _use_fp16 and DEVICE == "cuda":
+    _model = _model.half()
+    print("[backend] fp16 enabled")
+
+sa = StableAudioModel(_model, _cfg, device=DEVICE, model_half=_use_fp16)
 print("[backend] model loaded")
+
+# cancellation event — set by POST /api/cancel, cleared before each generate
+_cancel_event = threading.Event()
 
 
 def render_noise_spec_once():
@@ -51,9 +64,11 @@ def render_noise_spec_once():
     rng = np.random.default_rng(7)
     lat = rng.standard_normal((1, 256, T_lat)).astype(np.float32) * 0.3
     lat_t = torch.from_numpy(lat).to(DEVICE)
+    if _use_fp16 and DEVICE == "cuda":
+        lat_t = lat_t.half()
     with torch.inference_mode():
-        wav_t = sa.decode(lat_t, chunked=True)
-    wav_np = wav_t.cpu().numpy()[0]
+        wav_t = sa.same.decode(lat_t)
+    wav_np = wav_t.float().cpu().numpy()[0]
     render_spec_png(wav_np, out_path)
 
 state = {"audio_path": None, "version": 0}
@@ -80,8 +95,6 @@ def compute_envelope(audio_np):
 
 
 def render_spec_png(audio_np, out_path):
-    import matplotlib.pyplot as plt
-    from scipy.signal import stft
     mono = audio_np.mean(axis=0) if audio_np.ndim == 2 else audio_np
     n_fft = 8192
     hop = DOWNSAMPLE
@@ -104,7 +117,6 @@ def render_spec_png(audio_np, out_path):
 
 
 def render_overview_png(audio_np, out_path, W=2000, H=80):
-    import matplotlib.pyplot as plt
     mono = audio_np.mean(axis=0) if audio_np.ndim == 2 else audio_np
     bin_sz = max(1, len(mono) // W)
     peaks = np.zeros(W)
@@ -121,28 +133,55 @@ def render_overview_png(audio_np, out_path, W=2000, H=80):
     plt.close(fig)
 
 
-def soft_limit(x, ceiling=0.97, knee=0.85):
-    s = np.sign(x)
-    a = np.abs(x)
-    out = np.where(
-        a <= knee,
-        a,
-        knee + (ceiling - knee) * np.tanh((a - knee) / (ceiling - knee)),
-    )
-    return s * out
-
-
 def persist_audio(audio_np):
-    """audio_np: (2, T) float in [-1, 1]. Writes wav + envelope.json + spec.png + overview.png."""
+    """audio_np: (2, T) float in [-1, 1].
+
+    Writes wav + envelope.json synchronously (fast path), then fires background
+    threads for spec.png and overview.png.  Returns the envelope immediately.
+    """
     p = DATA_DIR / "current.wav"
     sf.write(p, audio_np.T, SR)
     state["audio_path"] = str(p)
     state["version"] += 1
     env = compute_envelope(audio_np)
-    with open(DATA_DIR / "envelope.json", "w") as f: json.dump(env, f)
-    render_spec_png(audio_np, DATA_DIR / "current_spec.png")
-    render_overview_png(audio_np, DATA_DIR / "current_overview.png")
+    with open(DATA_DIR / "envelope.json", "w") as fh:
+        json.dump(env, fh)
+    # background PNG renders — don't block the response
+    threading.Thread(target=render_spec_png, args=(audio_np, DATA_DIR / "current_spec.png"), daemon=True).start()
+    threading.Thread(target=render_overview_png, args=(audio_np, DATA_DIR / "current_overview.png"), daemon=True).start()
     return env
+
+
+# -------- LoRA helpers --------
+
+_lora_applied = False
+
+def _apply_loras(loras: list[dict]) -> None:
+    """Load LoRA weights using SA3's native API."""
+    global _lora_applied
+    if not loras:
+        return
+    for entry in loras:
+        name = entry["name"]
+        strength = float(entry.get("strength", 1.0))
+        lora_path = LORA_DIR / name
+        if not lora_path.exists():
+            print(f"[lora] not found: {lora_path}, skipping")
+            continue
+        sa.load_lora(str(lora_path))
+        sa.set_lora_strength(strength)
+        _lora_applied = True
+        print(f"[lora] applied {name} @ {strength}")
+
+
+def _unload_loras(loras: list[dict]) -> None:
+    """Remove LoRA weights to restore original model."""
+    global _lora_applied
+    if not _lora_applied:
+        return
+    sa.set_lora_strength(0.0)
+    _lora_applied = False
+    print("[lora] unloaded")
 
 
 # -------- endpoints --------
@@ -163,14 +202,29 @@ async def upload(file: UploadFile = File(...)):
             "duration": env["count"] * DOWNSAMPLE / SR}
 
 
+class LoraEntry(BaseModel):
+    name: str
+    strength: float = 1.0
+
+
 class GenBody(BaseModel):
     prompt: str = ""
+    negative_prompt: str = ""
     mask: list[int] = []
     settings: dict = {}
+    loras: list[LoraEntry] = []
+
+
+@app.post("/api/cancel")
+async def cancel():
+    _cancel_event.set()
+    return {"status": "cancelling"}
 
 
 @app.post("/api/generate")
 async def generate(body: GenBody):
+    _cancel_event.clear()
+
     s = body.settings
     steps = int(s.get("steps", 8))
     cfg = float(s.get("cfg", 1.0))
@@ -183,7 +237,12 @@ async def generate(body: GenBody):
     n_regen = sum(body.mask) if body.mask else 0
     print(f"[generate] source={has_source} mask_len={len(body.mask) if body.mask else 0} regen_latents={n_regen} mode={('inpaint' if has_source and has_mask else 'vary' if has_source else 't2a')}")
 
-    kwargs = dict(prompt=body.prompt, steps=steps, cfg_scale=cfg, seed=seed, return_latents=True)
+    neg_prompt = body.negative_prompt or None
+    kwargs = dict(prompt=body.prompt, negative_prompt=neg_prompt, steps=steps,
+                  cfg_scale=cfg, seed=seed, return_latents=False, chunked_decode=True)
+
+    # ---- build audio_mask for inpaint (needed in stitch step too) ----
+    audio_mask = None
     if has_source and has_mask:
         audio, _ = sf.read(state["audio_path"])
         audio_t = torch.from_numpy(audio.T).float().to(DEVICE)
@@ -212,47 +271,62 @@ async def generate(body: GenBody):
         kwargs["duration"] = duration
         kwargs["sample_size"] = int(duration * SR)
 
-    t0 = time.time()
-    latents = sa.generate(**kwargs)
-    lat_np = latents.detach().to(torch.float32).cpu().numpy()
-    print(f"[backend] DIT {time.time()-t0:.1f}s, latents shape {lat_np.shape}")
+    loras_list = [l.model_dump() for l in body.loras]
 
-    t1 = time.time()
-    lat_t = torch.from_numpy(lat_np).to(DEVICE)
-    with torch.inference_mode():
-        use_chunked = lat_np.shape[-1] > 128
-        wav_t = sa.decode(lat_t, chunked=use_chunked, chunk_size=128, overlap=32)
-    wav_np = wav_t.cpu().numpy()[0]
-    print(f"[backend] AE {time.time()-t1:.1f}s")
+    def _run_generate():
+        """Heavy computation: DIT + AE + stitch. Runs in a thread pool."""
+        _apply_loras(loras_list)
+        try:
+            if _cancel_event.is_set():
+                return None
 
-    target_dur = float(kwargs.get("duration", duration))
-    max_samples = int(target_dur * SR)
-    print(f"[truncate] mode={'inpaint' if (has_source and has_mask) else 'vary' if has_source else 't2a'} target_dur={target_dur:.2f}s max_samples={max_samples} wav_len={wav_np.shape[-1]}")
-    if wav_np.shape[-1] > max_samples:
-        wav_np = wav_np[:, :max_samples]
+            t0 = time.time()
+            result = sa.generate(**kwargs)
+            wav_np = result.detach().to(torch.float32).cpu().numpy()[0]
+            print(f"[backend] DIT+AE {time.time()-t0:.1f}s, wav shape {wav_np.shape}")
 
-    if has_source and has_mask:
-        orig, _ = sf.read(state["audio_path"])
-        orig_t = orig.T
-        if orig_t.ndim == 1:
-            orig_t = np.stack([orig_t, orig_t], axis=0)
-        T = min(orig_t.shape[-1], wav_np.shape[-1], len(audio_mask))
-        m = audio_mask[:T].astype(np.float32)
-        m2 = np.stack([m, m], axis=0)
-        wav_np = wav_np[:, :T]
-        orig_t = orig_t[:, :T]
-        XF = 256
-        m_eased = m2.copy()
-        edges = np.where(np.abs(np.diff(m)) > 0)[0]
-        for e in edges:
-            lo = max(0, e - XF // 2)
-            hi = min(T, e + XF // 2)
-            w = np.linspace(0, 1, hi - lo)
-            if m[e] > m[e + 1] if e + 1 < T else False:
-                m_eased[:, lo:hi] = np.minimum(m_eased[:, lo:hi], 1 - w)
-            else:
-                m_eased[:, lo:hi] = np.maximum(m_eased[:, lo:hi], w)
-        wav_np = m_eased * orig_t + (1.0 - m_eased) * wav_np
+            if _cancel_event.is_set():
+                return None
+
+            # truncate
+            target_dur = float(kwargs.get("duration", duration))
+            max_samples = int(target_dur * SR)
+            print(f"[truncate] mode={'inpaint' if (has_source and has_mask) else 'vary' if has_source else 't2a'} target_dur={target_dur:.2f}s max_samples={max_samples} wav_len={wav_np.shape[-1]}")
+            if wav_np.shape[-1] > max_samples:
+                wav_np = wav_np[:, :max_samples]
+
+            # crossfade stitch
+            if has_source and has_mask and audio_mask is not None:
+                orig, _ = sf.read(state["audio_path"])
+                orig_t = orig.T
+                if orig_t.ndim == 1:
+                    orig_t = np.stack([orig_t, orig_t], axis=0)
+                T = min(orig_t.shape[-1], wav_np.shape[-1], len(audio_mask))
+                m = audio_mask[:T].astype(np.float32)
+                m2 = np.stack([m, m], axis=0)
+                wav_np = wav_np[:, :T]
+                orig_t = orig_t[:, :T]
+                XF = 256
+                m_eased = m2.copy()
+                edges = np.where(np.abs(np.diff(m)) > 0)[0]
+                for e in edges:
+                    lo = max(0, e - XF // 2)
+                    hi = min(T, e + XF // 2)
+                    w = np.linspace(0, 1, hi - lo)
+                    if (m[e] > m[e + 1]) if (e + 1 < T) else False:
+                        m_eased[:, lo:hi] = np.minimum(m_eased[:, lo:hi], 1 - w)
+                    else:
+                        m_eased[:, lo:hi] = np.maximum(m_eased[:, lo:hi], w)
+                wav_np = m_eased * orig_t + (1.0 - m_eased) * wav_np
+
+            return wav_np
+        finally:
+            _unload_loras(loras_list)
+
+    wav_np = await asyncio.to_thread(_run_generate)
+
+    if wav_np is None:
+        raise HTTPException(status_code=499, detail="generation cancelled")
 
     env = persist_audio(wav_np)
     return {"version": state["version"], "count": env["count"],

@@ -38,15 +38,19 @@ function togglePlay() {
 
   <!-- centered transport -->
   <div class="transport" class:disabled={!session.hasAudio}>
-    <button type="button" class="icon-btn" disabled={!session.hasAudio}><i class="bi bi-arrow-repeat"></i></button>
-    <button type="button" class="icon-btn" disabled={!session.hasAudio}><i class="bi bi-skip-backward-fill"></i></button>
+    <button type="button" class="icon-btn" class:active={session.looping} disabled={!session.hasAudio}
+      onclick={() => session.looping = !session.looping}><i class="bi bi-arrow-repeat"></i></button>
+    <button type="button" class="icon-btn" disabled={!session.hasAudio}
+      onclick={() => session.playhead = 0}><i class="bi bi-skip-backward-fill"></i></button>
     <button type="button" class="icon-btn play" disabled={!session.hasAudio} onclick={togglePlay}>
       <i class="bi {session.playing ? 'bi-pause-fill' : 'bi-play-fill'}"></i>
     </button>
-    <button type="button" class="icon-btn" disabled={!session.hasAudio} onclick={() => session.playing = false}>
+    <button type="button" class="icon-btn" disabled={!session.hasAudio}
+      onclick={() => { session.playing = false; session.playhead = 0; }}>
       <i class="bi bi-stop-fill"></i>
     </button>
-    <button type="button" class="icon-btn" disabled={!session.hasAudio}><i class="bi bi-skip-forward-fill"></i></button>
+    <button type="button" class="icon-btn" disabled={!session.hasAudio}
+      onclick={() => session.playhead = 1}><i class="bi bi-skip-forward-fill"></i></button>
   </div>
 
   <!-- right cluster -->
@@ -98,6 +102,7 @@ function togglePlay() {
   justify-self: end;
 }
 .icon-btn.play { color: var(--text-primary); font-size: 16px; }
+.icon-btn.active { color: var(--accent-blue); }
 .icon-btn[disabled] { color: var(--text-muted); cursor: default; }
 .icon-btn[disabled]:hover { background: transparent; color: var(--text-muted); }
 .volume { display: flex; align-items: center; gap: var(--gap-2); }

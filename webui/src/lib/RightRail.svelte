@@ -61,6 +61,10 @@ async function clickGenerate() {
       <span class="text-muted">{promptCharCount} / 500</span>
       <button class="link" onclick={() => session.prompt = ""}>Clear</button>
     </div>
+    <details class="neg-prompt-section">
+      <summary class="neg-prompt-toggle">Negative prompt</summary>
+      <textarea class="prompt-input neg-prompt" bind:value={session.negativePrompt} placeholder="what to avoid..."></textarea>
+    </details>
   </section>
 
   <section class="cta-panel">
@@ -355,4 +359,17 @@ async function clickGenerate() {
   min-width: 48px;
   text-align: center;
 }
+.neg-prompt-section {
+  margin-top: var(--gap-1);
+}
+.neg-prompt-toggle {
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  padding: var(--gap-1) 0;
+  letter-spacing: 0.04em;
+}
+.neg-prompt-toggle:hover { color: var(--text-secondary); }
+.neg-prompt { margin-top: var(--gap-2); min-height: 48px; }
 </style>
