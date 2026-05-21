@@ -101,8 +101,12 @@ def render_spec_png(audio_np, out_path):
     f, t, Z = stft(mono, fs=SR, nperseg=n_fft, noverlap=n_fft - hop, boundary=None, padded=False)
     P = np.abs(Z) ** 2
     P_db = 10.0 * np.log10(P + 1e-12)
-    P_db = np.clip(P_db, -55, P_db.max()); P_db -= P_db.min(); P_db /= P_db.max() + 1e-12
-    P_db = P_db ** 0.55
+    P_db = np.clip(P_db, -55, P_db.max()); P_db -= P_db.min()
+    if P_db.max() < 1e-6:
+        P_db = np.zeros_like(P_db)
+    else:
+        P_db /= P_db.max()
+        P_db = P_db ** 0.55
     out_h = 600
     log_f = np.geomspace(30, 16000, out_h)
     spec_log = np.zeros((out_h, P_db.shape[1]), dtype=np.float32)
@@ -154,13 +158,18 @@ def persist_audio(audio_np):
 
 # -------- LoRA helpers --------
 
-_lora_applied = False
+_loaded_lora_name: str | None = None  # name of the currently loaded LoRA (None = no LoRA loaded)
 
 def _apply_loras(loras: list[dict]) -> None:
-    """Load LoRA weights using SA3's native API."""
-    global _lora_applied
+    """Load LoRA weights using SA3's native API.
+
+    SA3 supports one LoRA at a time — loading a new one replaces the previous.
+    We track which LoRA is loaded to avoid redundant load_lora() calls.
+    """
+    global _loaded_lora_name
     if not loras:
         return
+    # SA3 only supports a single LoRA; use the first valid entry
     for entry in loras:
         name = entry["name"]
         strength = float(entry.get("strength", 1.0))
@@ -168,20 +177,21 @@ def _apply_loras(loras: list[dict]) -> None:
         if not lora_path.exists():
             print(f"[lora] not found: {lora_path}, skipping")
             continue
-        sa.load_lora(str(lora_path))
+        if _loaded_lora_name != name:
+            sa.load_lora(str(lora_path))
+            _loaded_lora_name = name
+            print(f"[lora] loaded {name}")
         sa.set_lora_strength(strength)
-        _lora_applied = True
-        print(f"[lora] applied {name} @ {strength}")
+        print(f"[lora] strength {name} @ {strength}")
+        return  # only one LoRA at a time
 
 
 def _unload_loras(loras: list[dict]) -> None:
-    """Remove LoRA weights to restore original model."""
-    global _lora_applied
-    if not _lora_applied:
+    """Deactivate LoRA by zeroing strength. Weights stay loaded but inactive."""
+    if _loaded_lora_name is None:
         return
     sa.set_lora_strength(0.0)
-    _lora_applied = False
-    print("[lora] unloaded")
+    print(f"[lora] deactivated {_loaded_lora_name}")
 
 
 # -------- endpoints --------

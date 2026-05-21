@@ -6,10 +6,17 @@ let promptCharCount = $derived(session.prompt.length);
 
 let ctaLabel = $derived.by(() => {
   if (!session.hasAudio) return "Generate";
-  if (!session.hasMask) return session.noise > 0 ? "Vary" : "Generate";
-  return "Inpaint";
+  if (session.hasMask) return "Inpaint";
+  if (session.noise > 0) return "Vary";
+  return "Generate";
 });
-let ctaVisible = $derived(true);
+
+let ctaVisible = $derived.by(() => {
+  if (!session.hasAudio) return true;
+  if (session.hasMask) return true;
+  if (session.noise > 0) return true;
+  return false;
+});
 
 let loraLibrary = $state([]);
 let loraDir = $state("");
@@ -46,6 +53,11 @@ function rerollSeed() {
   session.seed = Math.floor(Math.random() * 1000000);
 }
 
+async function rerollGenerate() {
+  rerollSeed();
+  try { await apiGenerate(); } catch (e) { console.error(e); alert("generate failed: " + e.message); }
+}
+
 async function clickGenerate() {
   if (session.generating) { cancelGenerate(); return; }
   try { await apiGenerate(); } catch (e) { console.error(e); alert("generate failed: " + e.message); }
@@ -68,14 +80,38 @@ async function clickGenerate() {
   </section>
 
   <section class="cta-panel">
-    <button class="btn btn-primary btn-lg" onclick={clickGenerate}>
-      {#if session.generating}
-        <i class="bi bi-stop-circle"></i> Cancel
-      {:else}
-        <i class="bi bi-magic"></i> {ctaLabel}
+    {#if ctaVisible || session.generating}
+      <button class="btn btn-primary btn-lg" onclick={clickGenerate}>
+        {#if session.generating}
+          <i class="bi bi-stop-circle"></i> Cancel
+        {:else}
+          <i class="bi bi-magic"></i> {ctaLabel}
+        {/if}
+      </button>
+      {#if !session.generating && session.hasAudio}
+        <button class="btn btn-ghost btn-square" onclick={rerollGenerate} title="Reroll (new seed)">
+          <i class="bi bi-dice-5"></i>
+        </button>
       {/if}
-    </button>
+    {/if}
+    {#if !ctaVisible && !session.generating}
+      <div class="cta-hint">paint latents or raise A2A noise to generate</div>
+    {/if}
   </section>
+
+  {#if session.variants.length > 0}
+    <div class="variant-nav">
+      <button class="icon-btn" disabled={session.variantIndex <= 0}
+        onclick={() => session.variantIndex--}>
+        <i class="bi bi-chevron-left"></i>
+      </button>
+      <span class="variant-count">{session.variantLabel}</span>
+      <button class="icon-btn" disabled={session.variantIndex >= session.variants.length - 1}
+        onclick={() => session.variantIndex++}>
+        <i class="bi bi-chevron-right"></i>
+      </button>
+    </div>
+  {/if}
 
   <Panel title="Generation">
     {#snippet children()}
@@ -344,6 +380,7 @@ async function clickGenerate() {
 }
 .cta-panel .btn-primary { height: 36px; padding: 0 var(--gap-3); border-radius: 4px; border: 0; }
 .cta-panel .btn-square { border-radius: 4px; }
+.cta-hint { padding: 0 var(--gap-4) var(--gap-4); font-size: 11px; color: var(--text-muted); font-style: italic; text-align: center; }
 .variant-nav {
   display: flex;
   align-items: center;

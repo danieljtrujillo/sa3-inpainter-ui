@@ -87,6 +87,11 @@ let playheadTimeLabel = $derived.by(() => {
   return `${String(m).padStart(2, "0")}:${s.toFixed(3).padStart(6, "0")}`;
 });
 
+let gridRows = $derived(
+  session.visMode === "spectrogram" ? "1fr 0" :
+  session.visMode === "waveform" ? "0 1fr" : "65% 35%"
+);
+
 // transform on the displayed image so zoom pan/scale follows zoom rect
 let imgTransform = $derived.by(() => {
   const span = Math.max(0.001, session.zoomEnd - session.zoomStart);
@@ -208,6 +213,7 @@ $effect(() => {
     onpointerup={onPointerUp}
     onpointercancel={onPointerUp}
     onwheel={onWheel}
+    style="grid-template-rows: {gridRows}"
   >
     <div class="pane spec-pane" class:with-audio={session.hasAudio}>
       {#if session.hasAudio}

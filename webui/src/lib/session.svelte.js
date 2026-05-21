@@ -37,7 +37,7 @@ class Session {
   playing = $state(false);
   looping = $state(false);
   volume = $state(0.7); // 0..1
-  visMode = $state("spectrogram");
+  visMode = $state("both");
 
   // prompt + settings
   prompt = $state("");
@@ -50,6 +50,26 @@ class Session {
   duration = $state(190); // text-to-audio length (sec)
 
   loras = $state([]);
+
+  // variant history
+  variants = $state([]); // array of { version, prompt, seed }
+  variantIndex = $state(-1); // -1 = no variants yet
+
+  get variantLabel() {
+    if (this.variants.length === 0) return "";
+    return `${this.variantIndex + 1} / ${this.variants.length}`;
+  }
+
+  pushVariant() {
+    const snap = {
+      version: this.version,
+      prompt: this.prompt,
+      seed: this.seed,
+    };
+    // if we're not at the end, truncate forward history
+    this.variants = [...this.variants.slice(0, this.variantIndex + 1), snap];
+    this.variantIndex = this.variants.length - 1;
+  }
 
   generating = $state(false);
   scrubbingNoise = $state(false); // true while the user is actively dragging the A2A slider
@@ -185,6 +205,7 @@ export async function apiGenerate() {
     session.hasAudio = true;
     session.version = j.version;
     session.setTrackInfo(j);
+    session.pushVariant();
     // remember the inpainted regions as ghost (visual recall), then clear the live mask
     if (body.mask.some((v) => v)) {
       session.ghostMask = new Uint8Array(body.mask);
