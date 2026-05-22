@@ -16,6 +16,8 @@ os.environ.setdefault("PYTHONWARNINGS", "ignore")
 import numpy as np
 import torch
 import soundfile as sf
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.signal import stft
 
@@ -161,7 +163,7 @@ def render_noise_spec_once():
     wav_np = _decode_latents(lat)
     render_spec_png(wav_np, out_path)
 
-state = {"audio_path": None, "version": 0}
+state = {"audio_path": None, "version": 0, "bpm": None}
 app = FastAPI()
 
 
@@ -284,8 +286,10 @@ async def upload(file: UploadFile = File(...)):
         a = torchaudio.transforms.Resample(sr, SR)(a)
         audio = a.numpy().T
     env = persist_audio(audio.T)
+    bpm = detect_bpm(audio.T, SR)
+    state["bpm"] = bpm
     return {"version": state["version"], "count": env["count"],
-            "duration": env["count"] * DOWNSAMPLE / SR}
+            "duration": env["count"] * DOWNSAMPLE / SR, "bpm": bpm}
 
 
 class LoraEntry(BaseModel):
@@ -466,8 +470,89 @@ async def generate(body: GenBody):
         raise HTTPException(status_code=499, detail="generation cancelled")
 
     env = persist_audio(wav_np)
+    bpm = detect_bpm(wav_np, SR)
+    state["bpm"] = bpm
     return {"version": state["version"], "count": env["count"],
-            "duration": env["count"] * DOWNSAMPLE / SR}
+            "duration": env["count"] * DOWNSAMPLE / SR, "bpm": bpm}
+
+
+def detect_bpm(audio_np, sr=44100):
+    """Detect BPM via onset strength autocorrelation. audio_np: (channels, T) or (T,)."""
+    from scipy.signal import find_peaks
+    mono = audio_np.mean(axis=0) if audio_np.ndim == 2 else audio_np
+    # compute spectral flux onset strength
+    hop = 512
+    n_fft = 2048
+    n_frames = (len(mono) - n_fft) // hop + 1
+    if n_frames < 16:
+        return 120.0
+    onset = np.zeros(n_frames)
+    prev_spec = np.zeros(n_fft // 2 + 1)
+    for i in range(n_frames):
+        frame = mono[i * hop : i * hop + n_fft] * np.hanning(n_fft)
+        spec = np.abs(np.fft.rfft(frame))
+        diff = spec - prev_spec
+        onset[i] = np.sum(np.maximum(0, diff))
+        prev_spec = spec
+    # autocorrelation in BPM range 40-220
+    min_lag = int(60.0 / 220 * sr / hop)
+    max_lag = int(60.0 / 40 * sr / hop)
+    max_lag = min(max_lag, len(onset) // 2)
+    if min_lag >= max_lag:
+        return 120.0
+    onset_norm = onset - onset.mean()
+    corr = np.correlate(onset_norm, onset_norm, mode='full')
+    corr = corr[len(onset_norm) - 1:]  # positive lags only
+    corr_range = corr[min_lag:max_lag]
+    if len(corr_range) == 0:
+        return 120.0
+    peaks, props = find_peaks(corr_range, distance=int(0.3 * sr / hop))
+    if len(peaks) == 0:
+        best_lag = min_lag + np.argmax(corr_range)
+    else:
+        best_idx = np.argmax(corr_range[peaks])
+        best_lag = min_lag + peaks[best_idx]
+    bpm = 60.0 * sr / hop / best_lag
+    # snap to reasonable range, handle octave errors
+    if bpm > 180:
+        bpm /= 2
+    elif bpm < 60:
+        bpm *= 2
+    return round(bpm, 1)
+
+
+class TempoBody(BaseModel):
+    factor: float = 1.0  # >1 = faster, <1 = slower
+
+
+@app.post("/api/tempo")
+async def tempo_change(body: TempoBody):
+    if state["audio_path"] is None:
+        raise HTTPException(400, "no audio loaded")
+    factor = body.factor
+    if factor <= 0.1 or factor > 10.0:
+        raise HTTPException(400, "factor must be in (0.1, 10.0]")
+    if abs(factor - 1.0) < 0.001:
+        return {"version": state["version"], "count": 0, "duration": 0}
+
+    src = state["audio_path"]
+    dst = str(DATA_DIR / "tempo_out.wav")
+    proc = await asyncio.create_subprocess_exec(
+        "rubberband", "--fine", "--tempo", str(factor), src, dst,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise HTTPException(500, f"rubberband failed: {stderr.decode()[:200]}")
+
+    audio, sr_out = sf.read(dst)
+    if audio.ndim == 1:
+        audio = np.stack([audio, audio], axis=-1)
+    env = persist_audio(audio.T)
+    bpm = detect_bpm(audio.T, SR)
+    state["bpm"] = bpm
+    return {"version": state["version"], "count": env["count"],
+            "duration": env["count"] * DOWNSAMPLE / SR, "bpm": bpm}
 
 
 @app.post("/api/clear")
@@ -480,7 +565,8 @@ async def clear():
 @app.get("/api/state")
 async def get_state():
     return {"has_audio": state["audio_path"] is not None, "version": state["version"],
-            "model_loaded": sa is not None, "backend": BACKEND, "model": _current_model}
+            "model_loaded": sa is not None, "backend": BACKEND, "model": _current_model,
+            "bpm": state.get("bpm")}
 
 
 import psutil

@@ -87,10 +87,7 @@ let playheadTimeLabel = $derived.by(() => {
   return `${String(m).padStart(2, "0")}:${s.toFixed(3).padStart(6, "0")}`;
 });
 
-let gridRows = $derived(
-  session.visMode === "spectrogram" ? "1fr 0" :
-  session.visMode === "waveform" ? "0 1fr" : "65% 35%"
-);
+let gridRows = "65% 35%";
 
 // transform on the displayed image so zoom pan/scale follows zoom rect
 let imgTransform = $derived.by(() => {

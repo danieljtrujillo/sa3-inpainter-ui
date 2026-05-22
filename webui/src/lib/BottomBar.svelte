@@ -47,14 +47,12 @@ function togglePlay() {
 
   <!-- right cluster -->
   <div class="right-cluster">
-    <div class="vis-toggle-group">
-      <button class="vis-pill" class:active={session.visMode === "spectrogram"}
-        onclick={() => session.visMode = "spectrogram"}>Spec</button>
-      <button class="vis-pill" class:active={session.visMode === "both"}
-        onclick={() => session.visMode = "both"}>Both</button>
-      <button class="vis-pill" class:active={session.visMode === "waveform"}
-        onclick={() => session.visMode = "waveform"}>Wave</button>
-    </div>
+    <button class="mode-toggle" class:active={session.advancedMode}
+      onclick={() => session.advancedMode = !session.advancedMode}
+      title={session.advancedMode ? "Switch to simple mode" : "Switch to advanced mode"}>
+      <i class="bi {session.advancedMode ? 'bi-toggles' : 'bi-sliders'}"></i>
+      {session.advancedMode ? "Advanced" : "Simple"}
+    </button>
     <div class="status">
       <span class="status-dot" class:ok={session.modelLoaded}></span>
       <span class="status-label">{session.modelLoaded ? "Model ready" : "Loading…"}</span>
@@ -135,11 +133,22 @@ function togglePlay() {
 .time-sep { color: var(--text-muted); }
 .time-total { color: var(--text-secondary); }
 .meta-info { color: var(--text-muted); }
-.vis-toggle { color: var(--text-primary); }
-.vis-toggle-group { display: flex; gap: 0; border: 1px solid var(--border-color); border-radius: 3px; overflow: hidden; }
-.vis-pill { padding: 2px 8px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; background: transparent; color: var(--text-muted); border: none; cursor: pointer; }
-.vis-pill:hover { color: var(--text-secondary); }
-.vis-pill.active { background: var(--accent-blue); color: var(--text-primary); }
+.mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: 2px 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+}
+.mode-toggle:hover { color: var(--text-secondary); }
+.mode-toggle.active { color: var(--accent-blue); border-color: var(--accent-blue); }
 .status-label { font-size: 10px; color: var(--text-muted); }
 .status {
   display: flex;

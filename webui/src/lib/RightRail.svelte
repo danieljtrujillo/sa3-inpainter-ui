@@ -1,5 +1,5 @@
 <script>
-import { session, apiGenerate, cancelGenerate, apiSwitchModel } from "./session.svelte.js";
+import { session, apiGenerate, cancelGenerate, apiSwitchModel, apiTempo } from "./session.svelte.js";
 import Panel from "./Panel.svelte";
 
 let promptCharCount = $derived(session.prompt.length);
@@ -83,6 +83,31 @@ async function clickGenerate() {
   if (session.generating) { cancelGenerate(); return; }
   try { await apiGenerate(); } catch (e) { console.error(e); }
 }
+
+let targetBpm = $state("");
+let tempoProcessing = $state(false);
+
+let tempoFactor = $derived.by(() => {
+  const target = parseFloat(targetBpm);
+  if (!target || !session.bpm || target <= 0) return null;
+  return target / session.bpm;
+});
+
+async function applyTempo() {
+  if (tempoProcessing || !tempoFactor || Math.abs(tempoFactor - 1.0) < 0.001) return;
+  tempoProcessing = true;
+  try {
+    await apiTempo(tempoFactor);
+    targetBpm = "";
+  } finally {
+    tempoProcessing = false;
+  }
+}
+
+function setTargetFromSlider(e) {
+  const val = parseFloat(e.target.value);
+  if (session.bpm) targetBpm = (session.bpm * val).toFixed(1);
+}
 </script>
 
 <aside class="right-rail">
@@ -159,26 +184,6 @@ async function clickGenerate() {
           </select>
         </div>
       {/if}
-      <div class="form-row">
-        <label>Sampler</label>
-        <select class="select" bind:value={session.samplerType}>
-          <option value="">Default (Pingpong)</option>
-          <optgroup label="SA3 Built-in">
-            <option value="euler">Euler</option>
-            <option value="rk4">RK4</option>
-            <option value="dpmpp">DPM++ (flow)</option>
-            <option value="pingpong">Pingpong</option>
-          </optgroup>
-          <optgroup label="RES4LYF (Exponential)">
-            <option value="res_2s">RES 2s</option>
-            <option value="res_2s_stable">RES 2s Stable</option>
-            <option value="res_3s">RES 3s</option>
-            <option value="res_5s">RES 5s (HO4)</option>
-            <option value="dpmpp_2s">DPM++ 2s (exp)</option>
-            <option value="dpmpp_3s">DPM++ 3s (exp)</option>
-          </optgroup>
-        </select>
-      </div>
       <!-- Length: only matters when generating from scratch (no source loaded) -->
       <div class="form-row" class:disabled={session.hasAudio}>
         <label>Length</label>
@@ -200,13 +205,6 @@ async function clickGenerate() {
         <div class="slider-row">
           <input type="range" min="1" max="10" step="0.1" bind:value={session.cfg} class="slider">
           <span class="value">{session.cfg.toFixed(1)}</span>
-        </div>
-      </div>
-      <div class="form-row">
-        <label>APG</label>
-        <div class="slider-row">
-          <input type="range" min="0" max="2" step="0.05" bind:value={session.apgScale} class="slider">
-          <span class="value">{session.apgScale.toFixed(2)}</span>
         </div>
       </div>
       <!-- A2A strength: always visible, greyed when inpainting (mask present) or no source.
@@ -238,8 +236,67 @@ async function clickGenerate() {
     {/snippet}
   </Panel>
 
+  {#if session.advancedMode}
+  <Panel title="Transform" defaultOpen={false}>
+    {#snippet children()}
+      <div class="form-row" class:disabled={!session.hasAudio}>
+        <label>BPM</label>
+        <div class="tempo-row">
+          <span class="bpm-detected" title="Detected BPM">{session.bpm ? session.bpm.toFixed(1) : "—"}</span>
+          <i class="bi bi-arrow-right bpm-arrow"></i>
+          <input type="number" class="bpm-input" bind:value={targetBpm}
+                 placeholder={session.bpm ? session.bpm.toFixed(0) : "—"}
+                 disabled={!session.hasAudio || tempoProcessing}
+                 min="20" max="999" step="0.1">
+          <button class="btn btn-sm" onclick={applyTempo}
+                  disabled={!session.hasAudio || tempoProcessing || !tempoFactor || Math.abs(tempoFactor - 1.0) < 0.001}>
+            {tempoProcessing ? "…" : "Apply"}
+          </button>
+        </div>
+      </div>
+      {#if session.hasAudio && session.bpm}
+        <div class="form-row">
+          <label>Ratio</label>
+          <div class="slider-row">
+            <input type="range" min="0.25" max="4.0" step="0.01" value={tempoFactor || 1.0}
+                   oninput={setTargetFromSlider} class="slider"
+                   disabled={tempoProcessing}>
+            <span class="value">{tempoFactor ? tempoFactor.toFixed(2) + "×" : "1.00×"}</span>
+          </div>
+        </div>
+      {/if}
+    {/snippet}
+  </Panel>
+
   <Panel title="Advanced" defaultOpen={false}>
     {#snippet children()}
+      <div class="form-row">
+        <label>Sampler</label>
+        <select class="select" bind:value={session.samplerType}>
+          <option value="">Pingpong (default)</option>
+          <optgroup label="SA3 Built-in">
+            <option value="euler">Euler</option>
+            <option value="rk4">RK4</option>
+            <option value="dpmpp">DPM++ (flow)</option>
+            <option value="pingpong">Pingpong</option>
+          </optgroup>
+          <optgroup label="RES4LYF (Exponential)">
+            <option value="res_2s">RES 2s</option>
+            <option value="res_2s_stable">RES 2s Stable</option>
+            <option value="res_3s">RES 3s</option>
+            <option value="res_5s">RES 5s (HO4)</option>
+            <option value="dpmpp_2s">DPM++ 2s (exp)</option>
+            <option value="dpmpp_3s">DPM++ 3s (exp)</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>APG</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="2" step="0.05" bind:value={session.apgScale} class="slider">
+          <span class="value">{session.apgScale.toFixed(2)}</span>
+        </div>
+      </div>
       <div class="form-row">
         <label>Schedule</label>
         <select class="select" bind:value={session.distShiftType}>
@@ -347,6 +404,7 @@ async function clickGenerate() {
       </div>
     {/snippet}
   </Panel>
+  {/if}
 
   <section class="loras-section">
     <header class="loras-header">
@@ -579,4 +637,42 @@ async function clickGenerate() {
 }
 .neg-prompt-toggle:hover { color: var(--text-secondary); }
 .neg-prompt { margin-top: var(--gap-2); min-height: 48px; }
+
+.tempo-row {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+}
+.bpm-detected {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  min-width: 36px;
+}
+.bpm-arrow {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.bpm-input {
+  background: var(--code-block);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  padding: 3px 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  width: 60px;
+  text-align: center;
+}
+.bpm-input:focus { outline: 1px solid var(--accent-blue); border-color: transparent; }
+.btn-sm {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--code-block);
+  color: var(--text-primary);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.btn-sm:hover:not(:disabled) { background: var(--code-highlight); }
+.btn-sm:disabled { opacity: 0.4; }
 </style>

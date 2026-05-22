@@ -25,6 +25,7 @@ class Session {
   // backend session
   version = $state(0); // bumped by backend on every change; bust caches
   hasAudio = $state(false);
+  bpm = $state(null);
 
   // mask is the single source of truth for what's painted
   mask = $state(new Uint8Array(0));
@@ -40,6 +41,7 @@ class Session {
   looping = $state(false);
   volume = $state(0.7); // 0..1
   visMode = $state("both");
+  advancedMode = $state(false);
 
   // prompt + settings
   prompt = $state("");
@@ -170,6 +172,7 @@ export async function apiState() {
   session.version = j.version;
   if (j.backend) session.backend = j.backend;
   if (j.model) session.model = j.model;
+  if (j.bpm != null) session.bpm = j.bpm;
   return j;
 }
 
@@ -205,7 +208,8 @@ export async function apiUpload(file) {
     session.hasAudio = true;
     session.version = j.version;
     session.setTrackInfo(j);
-    session.duration = Math.round(j.duration); // sync length slider to the loaded sample
+    session.duration = Math.round(j.duration);
+    if (j.bpm != null) session.bpm = j.bpm;
     return j;
   } catch (e) {
     toasts.error("Upload failed: " + e.message);
@@ -221,6 +225,26 @@ export async function apiClear() {
   session.ghostMask = new Uint8Array(0);
   session.trackSeconds = 0;
   return j;
+}
+
+export async function apiTempo(factor) {
+  try {
+    const r = await fetch("/api/tempo", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ factor }),
+    });
+    if (!r.ok) throw new Error("tempo change failed: " + r.status);
+    const j = await r.json();
+    session.version = j.version;
+    session.setTrackInfo(j);
+    session.mask = new Uint8Array(session.mask.length > 0 ? j.count : 0);
+    if (j.bpm != null) session.bpm = j.bpm;
+    toasts.success(`Tempo ×${factor.toFixed(2)}`);
+    return j;
+  } catch (e) {
+    toasts.error("Tempo failed: " + e.message);
+  }
 }
 
 let _genAbort = null;
@@ -291,6 +315,7 @@ export async function apiGenerate() {
     session.hasAudio = true;
     session.version = j.version;
     session.setTrackInfo(j);
+    if (j.bpm != null) session.bpm = j.bpm;
     session.pushVariant();
     // remember the inpainted regions as ghost (visual recall), then clear the live mask
     if (body.mask.some((v) => v)) {
