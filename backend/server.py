@@ -25,6 +25,9 @@ from pydantic import BaseModel
 
 from stable_audio_3.factory import create_diffusion_cond_from_config
 from stable_audio_3 import StableAudioModel
+from stable_audio_3.inference.distribution_shift import (
+    IdentityDistributionShift, FluxDistributionShift, DistributionShift, LogSNRShift
+)
 from safetensors.torch import load_file
 
 # -------- backend detection --------
@@ -116,6 +119,13 @@ def _load_model(name, local_path=None):
 _load_model("medium", local_path=LOCAL_MEDIUM)
 if _use_fp16 and DEVICE == "cuda":
     print("[backend] fp16 enabled")
+
+# register RES4LYF exponential RK samplers
+_backend_dir = str(Path(__file__).resolve().parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+from res4lyf.sampler import register_samplers, SAMPLER_NAMES as RES4LYF_NAMES
+register_samplers()
 
 
 # -------- decode helpers --------
@@ -310,6 +320,36 @@ async def generate(body: GenBody):
     sampler_type = s.get("sampler_type")
     apg_scale = float(s.get("apg_scale", 1.0))
 
+    # advanced params
+    scale_phi = float(s.get("scale_phi", 0.0))
+    cfg_interval = s.get("cfg_interval", [0.0, 1.0])
+    cfg_norm_threshold = float(s.get("cfg_norm_threshold", 0.0))
+    exit_layer_ix_raw = s.get("exit_layer_ix")
+    exit_layer_ix = int(exit_layer_ix_raw) if exit_layer_ix_raw else None
+    duration_padding_sec = float(s.get("duration_padding_sec", 6.0))
+
+    # dist_shift construction
+    dist_shift_type = s.get("dist_shift_type", "default")
+    dist_shift = None
+    if dist_shift_type == "none":
+        dist_shift = IdentityDistributionShift()
+    elif dist_shift_type == "logsnr":
+        dist_shift = LogSNRShift(
+            anchor_logsnr=float(s.get("dist_shift_anchor_logsnr", -6.2)),
+            rate=float(s.get("dist_shift_rate", 0.0)),
+            logsnr_end=float(s.get("dist_shift_logsnr_end", 2.0)),
+        )
+    elif dist_shift_type == "flux":
+        dist_shift = FluxDistributionShift(
+            alpha_min=float(s.get("dist_shift_alpha_min", 1.0)),
+            alpha_max=float(s.get("dist_shift_alpha_max", 1.0)),
+        )
+    elif dist_shift_type == "full":
+        dist_shift = DistributionShift(
+            base_shift=float(s.get("dist_shift_base_shift", 0.5)),
+            max_shift=float(s.get("dist_shift_max_shift", 1.15)),
+        )
+
     has_source = state["audio_path"] is not None
     has_mask = any(body.mask) if body.mask else False
     n_regen = sum(body.mask) if body.mask else 0
@@ -318,10 +358,21 @@ async def generate(body: GenBody):
     neg_prompt = body.negative_prompt or None
     kwargs = dict(prompt=body.prompt, negative_prompt=neg_prompt, steps=steps,
                   cfg_scale=cfg, seed=seed, apg_scale=apg_scale,
+                  duration_padding_sec=duration_padding_sec,
                   return_latents=_use_mlx_ae,
                   chunked_decode=(not _use_mlx_ae))
     if sampler_type:
         kwargs["sampler_type"] = sampler_type
+    if dist_shift is not None:
+        kwargs["dist_shift"] = dist_shift
+    if scale_phi != 0.0:
+        kwargs["scale_phi"] = scale_phi
+    if cfg_interval != [0.0, 1.0]:
+        kwargs["cfg_interval"] = tuple(cfg_interval)
+    if cfg_norm_threshold > 0:
+        kwargs["cfg_norm_threshold"] = cfg_norm_threshold
+    if exit_layer_ix is not None:
+        kwargs["exit_layer_ix"] = exit_layer_ix
 
     audio_mask = None
     if has_source and has_mask:

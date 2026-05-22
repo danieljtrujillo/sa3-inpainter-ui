@@ -55,6 +55,22 @@ class Session {
   backend = $state("");
   switchingModel = $state(false);
 
+  // advanced
+  scalePhi = $state(0.0);
+  cfgIntervalStart = $state(0.0);
+  cfgIntervalEnd = $state(1.0);
+  cfgNormThreshold = $state(0.0);
+  exitLayerIx = $state(0);
+  durationPaddingSec = $state(6.0);
+  distShiftType = $state("default");
+  distShiftAnchorLogsnr = $state(-6.2);
+  distShiftRate = $state(0.0);
+  distShiftLogsnrEnd = $state(2.0);
+  distShiftAlphaMin = $state(1.0);
+  distShiftAlphaMax = $state(1.0);
+  distShiftBaseShift = $state(0.5);
+  distShiftMaxShift = $state(1.15);
+
   loras = $state([]);
 
   // variant history
@@ -237,6 +253,31 @@ export async function apiGenerate() {
         duration: session.trackSeconds || session.duration,
         ...(session.samplerType ? { sampler_type: session.samplerType } : {}),
         apg_scale: session.apgScale,
+        scale_phi: session.scalePhi,
+        cfg_interval: [session.cfgIntervalStart, session.cfgIntervalEnd],
+        cfg_norm_threshold: session.cfgNormThreshold,
+        exit_layer_ix: session.exitLayerIx || null,
+        duration_padding_sec: session.durationPaddingSec,
+        dist_shift_type: session.distShiftType,
+        ...(session.distShiftType === "logsnr"
+          ? {
+              dist_shift_anchor_logsnr: session.distShiftAnchorLogsnr,
+              dist_shift_rate: session.distShiftRate,
+              dist_shift_logsnr_end: session.distShiftLogsnrEnd,
+            }
+          : {}),
+        ...(session.distShiftType === "flux"
+          ? {
+              dist_shift_alpha_min: session.distShiftAlphaMin,
+              dist_shift_alpha_max: session.distShiftAlphaMax,
+            }
+          : {}),
+        ...(session.distShiftType === "full"
+          ? {
+              dist_shift_base_shift: session.distShiftBaseShift,
+              dist_shift_max_shift: session.distShiftMaxShift,
+            }
+          : {}),
       },
     };
     const r = await fetch("/api/generate", {

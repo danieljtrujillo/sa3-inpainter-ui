@@ -162,9 +162,21 @@ async function clickGenerate() {
       <div class="form-row">
         <label>Sampler</label>
         <select class="select" bind:value={session.samplerType}>
-          <option value="">Default</option>
-          <option value="dpmpp-3m-sde">DPM++ 3M SDE</option>
-          <option value="dpmpp-2m-sde">DPM++ 2M SDE</option>
+          <option value="">Default (Pingpong)</option>
+          <optgroup label="SA3 Built-in">
+            <option value="euler">Euler</option>
+            <option value="rk4">RK4</option>
+            <option value="dpmpp">DPM++ (flow)</option>
+            <option value="pingpong">Pingpong</option>
+          </optgroup>
+          <optgroup label="RES4LYF (Exponential)">
+            <option value="res_2s">RES 2s</option>
+            <option value="res_2s_stable">RES 2s Stable</option>
+            <option value="res_3s">RES 3s</option>
+            <option value="res_5s">RES 5s (HO4)</option>
+            <option value="dpmpp_2s">DPM++ 2s (exp)</option>
+            <option value="dpmpp_3s">DPM++ 3s (exp)</option>
+          </optgroup>
         </select>
       </div>
       <!-- Length: only matters when generating from scratch (no source loaded) -->
@@ -221,6 +233,116 @@ async function clickGenerate() {
           <button class="icon-btn" onclick={rerollSeed} title="Random seed">
             <i class="bi bi-dice-5"></i>
           </button>
+        </div>
+      </div>
+    {/snippet}
+  </Panel>
+
+  <Panel title="Advanced" defaultOpen={false}>
+    {#snippet children()}
+      <div class="form-row">
+        <label>Schedule</label>
+        <select class="select" bind:value={session.distShiftType}>
+          <option value="default">Default</option>
+          <option value="logsnr">LogSNR</option>
+          <option value="flux">Flux</option>
+          <option value="full">Full</option>
+          <option value="none">None (linear)</option>
+        </select>
+      </div>
+      {#if session.distShiftType === "logsnr"}
+        <div class="form-row">
+          <label>Anchor</label>
+          <div class="slider-row">
+            <input type="range" min="-10" max="0" step="0.1" bind:value={session.distShiftAnchorLogsnr} class="slider">
+            <span class="value">{session.distShiftAnchorLogsnr.toFixed(1)}</span>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>Rate</label>
+          <div class="slider-row">
+            <input type="range" min="0" max="3" step="0.1" bind:value={session.distShiftRate} class="slider">
+            <span class="value">{session.distShiftRate.toFixed(1)}</span>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>SNR end</label>
+          <div class="slider-row">
+            <input type="range" min="-2" max="5" step="0.1" bind:value={session.distShiftLogsnrEnd} class="slider">
+            <span class="value">{session.distShiftLogsnrEnd.toFixed(1)}</span>
+          </div>
+        </div>
+      {:else if session.distShiftType === "flux"}
+        <div class="form-row">
+          <label>α min</label>
+          <div class="slider-row">
+            <input type="range" min="0.1" max="20" step="0.1" bind:value={session.distShiftAlphaMin} class="slider">
+            <span class="value">{session.distShiftAlphaMin.toFixed(1)}</span>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>α max</label>
+          <div class="slider-row">
+            <input type="range" min="0.1" max="20" step="0.1" bind:value={session.distShiftAlphaMax} class="slider">
+            <span class="value">{session.distShiftAlphaMax.toFixed(1)}</span>
+          </div>
+        </div>
+      {:else if session.distShiftType === "full"}
+        <div class="form-row">
+          <label>Base</label>
+          <div class="slider-row">
+            <input type="range" min="0" max="2" step="0.05" bind:value={session.distShiftBaseShift} class="slider">
+            <span class="value">{session.distShiftBaseShift.toFixed(2)}</span>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>Max</label>
+          <div class="slider-row">
+            <input type="range" min="0" max="3" step="0.05" bind:value={session.distShiftMaxShift} class="slider">
+            <span class="value">{session.distShiftMaxShift.toFixed(2)}</span>
+          </div>
+        </div>
+      {/if}
+      <div class="form-row">
+        <label>φ rescale</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="1" step="0.05" bind:value={session.scalePhi} class="slider">
+          <span class="value">{session.scalePhi.toFixed(2)}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>CFG from</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="1" step="0.05" bind:value={session.cfgIntervalStart} class="slider">
+          <span class="value">{session.cfgIntervalStart.toFixed(2)}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>CFG to</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="1" step="0.05" bind:value={session.cfgIntervalEnd} class="slider">
+          <span class="value">{session.cfgIntervalEnd.toFixed(2)}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>CFG clip</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="100" step="1" bind:value={session.cfgNormThreshold} class="slider">
+          <span class="value">{session.cfgNormThreshold || "off"}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Exit layer</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="24" step="1" bind:value={session.exitLayerIx} class="slider">
+          <span class="value">{session.exitLayerIx || "all"}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Padding</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="20" step="0.5" bind:value={session.durationPaddingSec} class="slider">
+          <span class="value">{session.durationPaddingSec.toFixed(1)}s</span>
         </div>
       </div>
     {/snippet}
