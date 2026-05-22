@@ -44,12 +44,16 @@ class Session {
   // prompt + settings
   prompt = $state("");
   negativePrompt = $state("");
-  model = $state("Medium (ARC)");
+  model = $state("medium");
   steps = $state(8);
   cfg = $state(1.0);
   noise = $state(0.65);
   seed = $state(-1);
   duration = $state(190); // text-to-audio length (sec)
+  samplerType = $state("");
+  apgScale = $state(1.0);
+  backend = $state("");
+  switchingModel = $state(false);
 
   loras = $state([]);
 
@@ -148,7 +152,31 @@ export async function apiState() {
   const j = await r.json();
   session.hasAudio = j.has_audio;
   session.version = j.version;
+  if (j.backend) session.backend = j.backend;
+  if (j.model) session.model = j.model;
   return j;
+}
+
+export async function apiSwitchModel(name) {
+  session.switchingModel = true;
+  session.modelLoaded = false;
+  try {
+    const r = await fetch("/api/model", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: name }),
+    });
+    if (!r.ok) throw new Error("model switch failed: " + r.status);
+    const j = await r.json();
+    session.model = name;
+    session.modelLoaded = true;
+    toasts.success(`Model ${name} loaded`);
+    return j;
+  } catch (e) {
+    toasts.error("Model switch failed: " + e.message);
+  } finally {
+    session.switchingModel = false;
+  }
 }
 
 export async function apiUpload(file) {
@@ -207,6 +235,8 @@ export async function apiGenerate() {
         seed: session.seed,
         noise: session.noise,
         duration: session.trackSeconds || session.duration,
+        ...(session.samplerType ? { sampler_type: session.samplerType } : {}),
+        apg_scale: session.apgScale,
       },
     };
     const r = await fetch("/api/generate", {

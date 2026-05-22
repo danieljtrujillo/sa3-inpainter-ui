@@ -3,9 +3,11 @@
 Loads the SA3 medium model once at startup (~30s), exposes JSON API for the
 Svelte frontend.
 
-CUDA port: uses SA3's built-in torch autoencoder instead of the MLX AE.
+Dual backend: auto-detects CUDA (torch AE) vs MPS (MLX AE).
+Set SA3_BACKEND=cuda or SA3_BACKEND=mlx to force.
 """
 import asyncio
+import gc
 import os, sys, json, time, threading, warnings
 from pathlib import Path
 warnings.filterwarnings("ignore")
@@ -25,50 +27,128 @@ from stable_audio_3.factory import create_diffusion_cond_from_config
 from stable_audio_3 import StableAudioModel
 from safetensors.torch import load_file
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# -------- backend detection --------
+
+def _detect_backend():
+    forced = os.environ.get("SA3_BACKEND", "").lower()
+    if forced == "cuda":
+        return "cuda", "cuda"
+    if forced == "mlx":
+        return "mlx", "mps"
+    if torch.cuda.is_available():
+        return "cuda", "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mlx", "mps"
+    return "cuda", "cpu"
+
+BACKEND, DEVICE = _detect_backend()
+HAS_MLX = BACKEND == "mlx"
+
+if HAS_MLX:
+    import mlx.core as mx
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from mlx_sa3.ae import SA3MediumAE, decode_chunked
+    from mlx_sa3.weights import load_ae_weights
+
 LOCAL_MEDIUM = os.environ.get("SA3_MODEL_DIR", str(Path.home() / "models/stable-audio-3-medium"))
-CKPT = f"{LOCAL_MEDIUM}/model.safetensors"
-CFG  = f"{LOCAL_MEDIUM}/model_config.json"
 DATA_DIR = Path("/tmp/sa3-inpainter"); DATA_DIR.mkdir(exist_ok=True)
 SR = 44100
 DOWNSAMPLE = 4096
 BANDS = [(0, 250), (250, 2500), (2500, 22050)]
 
-print(f"[backend] loading sa3 medium on {DEVICE}...")
-_cfg = json.load(open(CFG))
-for c in _cfg["model"]["conditioning"]["configs"]:
-    if c["type"] == "t5gemma":
-        c["config"]["repo_id"] = LOCAL_MEDIUM
-_model = create_diffusion_cond_from_config(_cfg)
-_model.load_state_dict(load_file(CKPT), strict=False)
-_model.eval().requires_grad_(False).to(DEVICE)
+# -------- model state --------
 
-# fp16 on CUDA if SA3_FP16=1 (or default True on CUDA)
+sa = None               # StableAudioModel instance
+mlx_ae = None           # MLX AE, only for medium on MPS
+_use_mlx_ae = False     # whether current model uses MLX AE decode path
+_current_model = None   # name of loaded model
 _use_fp16 = os.environ.get("SA3_FP16", "1" if DEVICE == "cuda" else "0") == "1"
+_cancel_event = threading.Event()
+_loaded_lora_name = None
+
+
+def _load_model(name, local_path=None):
+    """Load a model by name. local_path overrides for manual loading."""
+    global sa, mlx_ae, _use_mlx_ae, _current_model, _loaded_lora_name
+
+    # cleanup old model
+    sa = None
+    mlx_ae = None
+    _use_mlx_ae = False
+    _loaded_lora_name = None
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+    print(f"[backend] loading {name} on {DEVICE}...")
+    want_half = _use_fp16 and DEVICE == "cuda"
+
+    if local_path:
+        cfg_path = f"{local_path}/model_config.json"
+        ckpt_path = f"{local_path}/model.safetensors"
+        cfg = json.load(open(cfg_path))
+        for c in cfg["model"]["conditioning"]["configs"]:
+            if c["type"] == "t5gemma":
+                c["config"]["repo_id"] = local_path
+        model = create_diffusion_cond_from_config(cfg)
+        model.load_state_dict(load_file(ckpt_path), strict=False)
+        model.eval().requires_grad_(False).to(DEVICE)
+        if want_half:
+            model.half()
+        sa = StableAudioModel(model, cfg, device=DEVICE, model_half=want_half)
+
+        if HAS_MLX and name.startswith("medium"):
+            print("[backend] loading MLX AE...")
+            mlx_ae = SA3MediumAE()
+            load_ae_weights(mlx_ae, ckpt_path)
+            _use_mlx_ae = True
+            print("[backend] MLX AE loaded")
+    else:
+        sa = StableAudioModel.from_pretrained(name, device=DEVICE, model_half=want_half)
+        # MLX AE only available for medium models loaded from local path;
+        # from_pretrained models fall back to torch AE on MPS (slower but works)
+
+    _current_model = name
+    print(f"[backend] {name} ready (mlx_ae={'yes' if _use_mlx_ae else 'no'})")
+
+
+# initial load
+_load_model("medium", local_path=LOCAL_MEDIUM)
 if _use_fp16 and DEVICE == "cuda":
-    _model = _model.half()
     print("[backend] fp16 enabled")
 
-sa = StableAudioModel(_model, _cfg, device=DEVICE, model_half=_use_fp16)
-print("[backend] model loaded")
 
-# cancellation event — set by POST /api/cancel, cleared before each generate
-_cancel_event = threading.Event()
+# -------- decode helpers --------
+
+def _decode_latents(lat_np):
+    """Decode latent numpy array → waveform numpy array.
+    lat_np: (1, 256, T_lat) float32
+    Returns: (channels, T_audio) float32 numpy
+    """
+    if _use_mlx_ae and mlx_ae is not None:
+        lat_mx = mx.array(lat_np)
+        if lat_np.shape[-1] > 128:
+            wav_m = decode_chunked(mlx_ae, lat_mx, chunk_size=128, overlap=32)
+        else:
+            wav_m = mlx_ae.decode(lat_mx)
+        mx.eval(wav_m)
+        return np.array(wav_m)[0]
+    else:
+        lat_t = torch.from_numpy(lat_np).to(DEVICE)
+        if _use_fp16 and DEVICE == "cuda":
+            lat_t = lat_t.half()
+        with torch.inference_mode():
+            wav_t = sa.same.decode(lat_t)
+        return wav_t.float().cpu().numpy()[0]
 
 
 def render_noise_spec_once():
-    """Decode 30s of random latents into a noise spectrogram for the slider preview overlay."""
     out_path = DATA_DIR / "noise_spec.png"
     if out_path.exists(): return
     T_lat = int(30 * SR / DOWNSAMPLE) + 1
     rng = np.random.default_rng(7)
     lat = rng.standard_normal((1, 256, T_lat)).astype(np.float32) * 0.3
-    lat_t = torch.from_numpy(lat).to(DEVICE)
-    if _use_fp16 and DEVICE == "cuda":
-        lat_t = lat_t.half()
-    with torch.inference_mode():
-        wav_t = sa.same.decode(lat_t)
-    wav_np = wav_t.float().cpu().numpy()[0]
+    wav_np = _decode_latents(lat)
     render_spec_png(wav_np, out_path)
 
 state = {"audio_path": None, "version": 0}
@@ -138,11 +218,7 @@ def render_overview_png(audio_np, out_path, W=2000, H=80):
 
 
 def persist_audio(audio_np):
-    """audio_np: (2, T) float in [-1, 1].
-
-    Writes wav + envelope.json synchronously (fast path), then fires background
-    threads for spec.png and overview.png.  Returns the envelope immediately.
-    """
+    """audio_np: (2, T) float in [-1, 1]."""
     p = DATA_DIR / "current.wav"
     sf.write(p, audio_np.T, SR)
     state["audio_path"] = str(p)
@@ -150,7 +226,6 @@ def persist_audio(audio_np):
     env = compute_envelope(audio_np)
     with open(DATA_DIR / "envelope.json", "w") as fh:
         json.dump(env, fh)
-    # background PNG renders — don't block the response
     threading.Thread(target=render_spec_png, args=(audio_np, DATA_DIR / "current_spec.png"), daemon=True).start()
     threading.Thread(target=render_overview_png, args=(audio_np, DATA_DIR / "current_overview.png"), daemon=True).start()
     return env
@@ -158,18 +233,10 @@ def persist_audio(audio_np):
 
 # -------- LoRA helpers --------
 
-_loaded_lora_name: str | None = None  # name of the currently loaded LoRA (None = no LoRA loaded)
-
 def _apply_loras(loras: list[dict]) -> None:
-    """Load LoRA weights using SA3's native API.
-
-    SA3 supports one LoRA at a time — loading a new one replaces the previous.
-    We track which LoRA is loaded to avoid redundant load_lora() calls.
-    """
     global _loaded_lora_name
     if not loras:
         return
-    # SA3 only supports a single LoRA; use the first valid entry
     for entry in loras:
         name = entry["name"]
         strength = float(entry.get("strength", 1.0))
@@ -183,11 +250,10 @@ def _apply_loras(loras: list[dict]) -> None:
             print(f"[lora] loaded {name}")
         sa.set_lora_strength(strength)
         print(f"[lora] strength {name} @ {strength}")
-        return  # only one LoRA at a time
+        return
 
 
 def _unload_loras(loras: list[dict]) -> None:
-    """Deactivate LoRA by zeroing strength. Weights stay loaded but inactive."""
     if _loaded_lora_name is None:
         return
     sa.set_lora_strength(0.0)
@@ -241,6 +307,8 @@ async def generate(body: GenBody):
     seed = int(s.get("seed", 42))
     noise = float(s.get("noise", 1.0))
     duration = float(s.get("duration", 30.0))
+    sampler_type = s.get("sampler_type")
+    apg_scale = float(s.get("apg_scale", 1.0))
 
     has_source = state["audio_path"] is not None
     has_mask = any(body.mask) if body.mask else False
@@ -249,9 +317,12 @@ async def generate(body: GenBody):
 
     neg_prompt = body.negative_prompt or None
     kwargs = dict(prompt=body.prompt, negative_prompt=neg_prompt, steps=steps,
-                  cfg_scale=cfg, seed=seed, return_latents=False, chunked_decode=True)
+                  cfg_scale=cfg, seed=seed, apg_scale=apg_scale,
+                  return_latents=_use_mlx_ae,
+                  chunked_decode=(not _use_mlx_ae))
+    if sampler_type:
+        kwargs["sampler_type"] = sampler_type
 
-    # ---- build audio_mask for inpaint (needed in stitch step too) ----
     audio_mask = None
     if has_source and has_mask:
         audio, _ = sf.read(state["audio_path"])
@@ -284,7 +355,6 @@ async def generate(body: GenBody):
     loras_list = [l.model_dump() for l in body.loras]
 
     def _run_generate():
-        """Heavy computation: DIT + AE + stitch. Runs in a thread pool."""
         _apply_loras(loras_list)
         try:
             if _cancel_event.is_set():
@@ -292,20 +362,26 @@ async def generate(body: GenBody):
 
             t0 = time.time()
             result = sa.generate(**kwargs)
-            wav_np = result.detach().to(torch.float32).cpu().numpy()[0]
-            print(f"[backend] DIT+AE {time.time()-t0:.1f}s, wav shape {wav_np.shape}")
+
+            if _use_mlx_ae:
+                lat_np = result.detach().to(torch.float32).cpu().numpy()
+                print(f"[backend] DIT {time.time()-t0:.1f}s, latents shape {lat_np.shape}")
+                t1 = time.time()
+                wav_np = _decode_latents(lat_np)
+                print(f"[backend] AE {time.time()-t1:.1f}s")
+            else:
+                wav_np = result.detach().to(torch.float32).cpu().numpy()[0]
+                print(f"[backend] DIT+AE {time.time()-t0:.1f}s, wav shape {wav_np.shape}")
 
             if _cancel_event.is_set():
                 return None
 
-            # truncate
             target_dur = float(kwargs.get("duration", duration))
             max_samples = int(target_dur * SR)
             print(f"[truncate] mode={'inpaint' if (has_source and has_mask) else 'vary' if has_source else 't2a'} target_dur={target_dur:.2f}s max_samples={max_samples} wav_len={wav_np.shape[-1]}")
             if wav_np.shape[-1] > max_samples:
                 wav_np = wav_np[:, :max_samples]
 
-            # crossfade stitch
             if has_source and has_mask and audio_mask is not None:
                 orig, _ = sf.read(state["audio_path"])
                 orig_t = orig.T
@@ -352,7 +428,8 @@ async def clear():
 
 @app.get("/api/state")
 async def get_state():
-    return {"has_audio": state["audio_path"] is not None, "version": state["version"], "model_loaded": True}
+    return {"has_audio": state["audio_path"] is not None, "version": state["version"],
+            "model_loaded": sa is not None, "backend": BACKEND, "model": _current_model}
 
 
 import psutil
@@ -367,8 +444,32 @@ async def list_loras():
     return {"dir": str(LORA_DIR), "files": files}
 
 
+VALID_MODELS = {"medium", "medium-base", "small-music", "small-sfx"}
+
+
+class ModelBody(BaseModel):
+    model: str
+
+
+@app.post("/api/model")
+async def switch_model(body: ModelBody):
+    name = body.model
+    if name not in VALID_MODELS:
+        raise HTTPException(400, f"unknown model: {name}")
+    if name == _current_model:
+        return {"model": name, "status": "already_loaded"}
+
+    try:
+        await asyncio.to_thread(_load_model, name)
+    except Exception as e:
+        raise HTTPException(500, f"model load failed: {e}")
+
+    return {"model": name, "status": "loaded", "backend": BACKEND,
+            "mlx_ae": _use_mlx_ae}
+
+
 class PrecisionBody(BaseModel):
-    precision: str  # "fp16" or "fp32"
+    precision: str
 
 
 @app.post("/api/precision")
@@ -380,10 +481,10 @@ async def set_precision(body: PrecisionBody):
     if DEVICE != "cuda":
         raise HTTPException(400, "precision switching requires CUDA")
     if want_fp16:
-        _model.half()
+        sa.model.half()
         sa.model_half = True
     else:
-        _model.float()
+        sa.model.float()
         sa.model_half = False
     _use_fp16 = want_fp16
     torch.cuda.empty_cache()
@@ -399,8 +500,10 @@ async def get_stats():
     ram_total_gb = vm.total / 1e9
     gpu_alloc_gb = 0.0
     try:
-        if torch.cuda.is_available():
+        if DEVICE == "cuda" and torch.cuda.is_available():
             gpu_alloc_gb = torch.cuda.memory_allocated() / 1e9
+        elif DEVICE == "mps" and hasattr(torch, "mps"):
+            gpu_alloc_gb = torch.mps.current_allocated_memory() / 1e9
     except Exception: pass
     return {
         "cpu": round(cpu, 1),
@@ -408,7 +511,9 @@ async def get_stats():
         "ram_total": round(ram_total_gb, 1),
         "gpu_alloc": round(gpu_alloc_gb, 2),
         "precision": "fp16" if _use_fp16 else "fp32",
-        "model_loaded": True,
+        "backend": BACKEND,
+        "model": _current_model,
+        "model_loaded": sa is not None,
     }
 
 
@@ -452,7 +557,7 @@ async def get_noise_spec():
 
 
 render_noise_spec_once()
-print("[backend] ready")
+print(f"[backend] ready (backend={BACKEND}, device={DEVICE})")
 
 if __name__ == "__main__":
     import uvicorn

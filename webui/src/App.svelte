@@ -213,6 +213,7 @@ async function pollStats() {
     };
     session.modelLoaded = j.model_loaded;
     if (j.precision) session.precision = j.precision;
+    if (j.backend) session.backend = j.backend;
   } catch (e) {
     session.modelLoaded = false;
   }

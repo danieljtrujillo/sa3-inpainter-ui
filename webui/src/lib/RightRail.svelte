@@ -1,5 +1,5 @@
 <script>
-import { session, apiGenerate, cancelGenerate } from "./session.svelte.js";
+import { session, apiGenerate, cancelGenerate, apiSwitchModel } from "./session.svelte.js";
 import Panel from "./Panel.svelte";
 
 let promptCharCount = $derived(session.prompt.length);
@@ -68,6 +68,12 @@ async function setPrecision(e) {
   } catch (err) { console.error("precision switch failed:", err); }
 }
 
+async function setModel(e) {
+  const name = e.target.value;
+  if (name === session.model) return;
+  try { await apiSwitchModel(name); } catch (err) { console.error(err); }
+}
+
 async function rerollGenerate() {
   rerollSeed();
   try { await apiGenerate(); } catch (e) { console.error(e); }
@@ -133,19 +139,32 @@ async function clickGenerate() {
       <div class="form-row">
         <label>
           Model
-          <span class="model-dot" class:ok={session.modelLoaded}
-                title={session.modelLoaded ? "model loaded" : "model not loaded"}></span>
+          <span class="model-dot" class:ok={session.modelLoaded && !session.switchingModel}
+                title={session.switchingModel ? "switching…" : session.modelLoaded ? "model loaded" : "model not loaded"}></span>
         </label>
-        <select class="select" bind:value={session.model}>
-          <option>Medium (ARC)</option>
-          <option>Medium-base (RF)</option>
+        <select class="select" value={session.model} onchange={setModel}
+                disabled={session.switchingModel || session.generating}>
+          <option value="medium">Medium (ARC)</option>
+          <option value="medium-base">Medium-base (RF)</option>
+          <option value="small-music">Small Music</option>
+          <option value="small-sfx">Small SFX</option>
         </select>
       </div>
+      {#if session.backend === "cuda"}
+        <div class="form-row">
+          <label>Precision</label>
+          <select class="select" value={session.precision} onchange={setPrecision}>
+            <option value="fp16">fp16 (fast, less VRAM)</option>
+            <option value="fp32">fp32 (higher quality)</option>
+          </select>
+        </div>
+      {/if}
       <div class="form-row">
-        <label>Precision</label>
-        <select class="select" value={session.precision} onchange={setPrecision}>
-          <option value="fp16">fp16 (fast, less VRAM)</option>
-          <option value="fp32">fp32 (higher quality)</option>
+        <label>Sampler</label>
+        <select class="select" bind:value={session.samplerType}>
+          <option value="">Default</option>
+          <option value="dpmpp-3m-sde">DPM++ 3M SDE</option>
+          <option value="dpmpp-2m-sde">DPM++ 2M SDE</option>
         </select>
       </div>
       <!-- Length: only matters when generating from scratch (no source loaded) -->
@@ -169,6 +188,13 @@ async function clickGenerate() {
         <div class="slider-row">
           <input type="range" min="1" max="10" step="0.1" bind:value={session.cfg} class="slider">
           <span class="value">{session.cfg.toFixed(1)}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>APG</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="2" step="0.05" bind:value={session.apgScale} class="slider">
+          <span class="value">{session.apgScale.toFixed(2)}</span>
         </div>
       </div>
       <!-- A2A strength: always visible, greyed when inpainting (mask present) or no source.
