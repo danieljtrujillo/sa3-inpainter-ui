@@ -1,9 +1,17 @@
 <script>
-import { session } from "./session.svelte.js";
+import { session, apiGetSettings } from "./session.svelte.js";
 import { fmtTime } from "./util.js";
+import SettingsModal from "./SettingsModal.svelte";
+import { onMount } from "svelte";
 
 let currentTime = $derived(session.playhead * session.trackSeconds);
 let totalTime = $derived(session.trackSeconds);
+let settingsOpen = $state(false);
+
+onMount(async () => {
+  const s = await apiGetSettings();
+  if (s?.first_run) settingsOpen = true;
+});
 
 function togglePlay() {
   session.playing = !session.playing;
@@ -53,6 +61,9 @@ function togglePlay() {
       <i class="bi {session.advancedMode ? 'bi-toggles' : 'bi-sliders'}"></i>
       {session.advancedMode ? "Advanced" : "Simple"}
     </button>
+    <button class="mode-toggle" onclick={() => settingsOpen = true} title="Settings">
+      <i class="bi bi-gear"></i>
+    </button>
     <div class="status">
       <span class="status-dot" class:ok={session.modelLoaded}></span>
       <span class="status-label">{session.modelLoaded ? "Model ready" : "Loading…"}</span>
@@ -73,6 +84,8 @@ function togglePlay() {
     </div>
   </div>
 </footer>
+
+<SettingsModal bind:visible={settingsOpen} />
 
 <style>
 .bottombar {
@@ -142,7 +155,7 @@ function togglePlay() {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted);
-  border: 1px solid var(--border-color);
+  border: 1px solid var(--accent-blue);
   border-radius: 3px;
   background: transparent;
   cursor: pointer;

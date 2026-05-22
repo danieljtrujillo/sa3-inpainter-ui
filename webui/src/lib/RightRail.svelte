@@ -1,5 +1,5 @@
 <script>
-import { session, apiGenerate, cancelGenerate, apiSwitchModel, apiTempo } from "./session.svelte.js";
+import { session, apiGenerate, cancelGenerate, apiSwitchModel, apiTempo, apiRedetectBpm, apiMemtokInfo, apiMemtokSet, apiMemtokAction, apiEmbeddingsList, apiEmbeddingCheckpoints, apiApplyCheckpoint, apiTrainEmbedding, apiTrainStatus, apiTrainLora, apiLoraTrainStatus, apiPreEncode, apiPreEncodeStatus, apiCheckEncoded, apiDecodeSettings, apiSetDecodeSettings } from "./session.svelte.js";
 import Panel from "./Panel.svelte";
 
 let promptCharCount = $derived(session.prompt.length);
@@ -53,6 +53,10 @@ function rerollSeed() {
   session.seed = Math.floor(Math.random() * 1000000);
 }
 
+function repeatSeed() {
+  if (session.lastSeed != null) session.seed = session.lastSeed;
+}
+
 async function setPrecision(e) {
   const val = e.target.value;
   try {
@@ -95,9 +99,10 @@ let tempoFactor = $derived.by(() => {
 
 async function applyTempo() {
   if (tempoProcessing || !tempoFactor || Math.abs(tempoFactor - 1.0) < 0.001) return;
+  const target = parseFloat(targetBpm);
   tempoProcessing = true;
   try {
-    await apiTempo(tempoFactor);
+    await apiTempo(tempoFactor, target > 0 ? target : null);
     targetBpm = "";
   } finally {
     tempoProcessing = false;
@@ -108,6 +113,188 @@ function setTargetFromSlider(e) {
   const val = parseFloat(e.target.value);
   if (session.bpm) targetBpm = (session.bpm * val).toFixed(1);
 }
+
+let memtokSaveName = $state("");
+
+// checkpoint editor
+let editingEmbed = $state(null);
+let checkpoints = $state([]);
+let selectedCkpt = $state(null);
+
+async function openCheckpointEditor(name) {
+  if (editingEmbed === name) { editingEmbed = null; return; }
+  const result = await apiEmbeddingCheckpoints(name);
+  checkpoints = result.checkpoints || [];
+  editingEmbed = name;
+  selectedCkpt = checkpoints.length > 0 ? checkpoints[checkpoints.length - 1].file : null;
+}
+
+async function applySelectedCheckpoint() {
+  if (!editingEmbed || !selectedCkpt) return;
+  await apiApplyCheckpoint(editingEmbed, selectedCkpt);
+  editingEmbed = null;
+}
+
+// embedding training
+let trainFolder = $state("");
+let trainName = $state("");
+let trainTokens = $state(4);
+let trainSteps = $state(500);
+let trainBatch = $state(0);
+let trainStatus = $state("idle");
+let trainStep = $state(0);
+let trainLoss = $state(0);
+let trainPollTimer = null;
+
+// lora training
+let loraFolder = $state("");
+let loraName = $state("");
+let loraCaption = $state("");
+let loraTrigger = $state("");
+let loraRank = $state(16);
+let loraSteps = $state(1000);
+let loraAdapter = $state("dora-rows");
+let loraCompile = $state(false);
+let loraBatch = $state(0);
+let loraStatus = $state("idle");
+let loraStep = $state(0);
+let loraLoss = $state(0);
+let loraPollTimer = null;
+
+// pre-encode
+let preEncodeStatus = $state("idle");
+let preEncodeBatch = $state(0);
+let preEncodeTotal = $state(0);
+let hasEncoded = $state(false);
+let encodedLatents = $state(0);
+
+async function browseLoraFolder() {
+  try {
+    const start = loraFolder || "~";
+    const r = await fetch(`/api/browse_folder?start=${encodeURIComponent(start)}`);
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.path) loraFolder = j.path;
+  } catch {}
+}
+
+async function checkEncodedStatus() {
+  if (!loraName) { hasEncoded = false; encodedLatents = 0; return; }
+  const j = await apiCheckEncoded(loraName);
+  hasEncoded = j.has_encoded;
+  encodedLatents = j.latents;
+}
+
+async function startPreEncode() {
+  if (!loraFolder || !loraName) return;
+  const caption = loraTrigger || loraCaption || loraName;
+  const result = await apiPreEncode(loraFolder, loraName, caption);
+  if (result) {
+    preEncodeStatus = "running";
+    preEncodeBatch = 0;
+    pollPreEncode();
+  }
+}
+
+async function pollPreEncode() {
+  const s = await apiPreEncodeStatus();
+  preEncodeStatus = s.status;
+  if (s.progress?.batch !== undefined) preEncodeBatch = s.progress.batch;
+  if (s.progress?.total !== undefined) preEncodeTotal = s.progress.total;
+  if (s.status === "running") {
+    setTimeout(pollPreEncode, 3000);
+  } else if (s.status === "done") {
+    await checkEncodedStatus();
+  }
+}
+
+async function startLoraTraining() {
+  if (!loraFolder || !loraName) return;
+  const caption = loraTrigger || loraCaption || loraName;
+  const result = await apiTrainLora({
+    folder: loraFolder, name: loraName, caption,
+    rank: loraRank, adapter_type: loraAdapter, steps: loraSteps,
+    batch_size: loraBatch, use_compile: loraCompile,
+  });
+  if (result) {
+    session.modelLoaded = false;
+    loraStatus = "running";
+    loraStep = 0;
+    loraLoss = 0;
+    pollLoraStatus();
+  }
+}
+
+async function pollLoraStatus() {
+  const s = await apiLoraTrainStatus();
+  loraStatus = s.status;
+  if (s.progress?.step !== undefined) loraStep = s.progress.step;
+  if (s.progress?.loss !== undefined) loraLoss = s.progress.loss;
+  if (s.result?.step !== undefined) loraStep = s.result.step;
+  if (s.status === "running") {
+    loraPollTimer = setTimeout(pollLoraStatus, 3000);
+  } else if (s.status === "done" || s.status === "error") {
+    if (s.status === "done") {
+      loraStep = loraSteps;
+      loraFolder = "";
+      loraName = "";
+      loraTrigger = "";
+      loraCaption = "";
+    }
+    if (s.model_reloaded) session.modelLoaded = true;
+  }
+}
+
+async function browseFolder() {
+  try {
+    const start = trainFolder || "~";
+    const r = await fetch(`/api/browse_folder?start=${encodeURIComponent(start)}`);
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.path) trainFolder = j.path;
+  } catch {}
+}
+
+async function startTraining() {
+  if (!trainFolder || !trainName) return;
+  const result = await apiTrainEmbedding(trainFolder, trainName, trainTokens, trainSteps, trainBatch);
+  if (result) {
+    trainStatus = "running";
+    pollTrainStatus();
+  }
+}
+
+async function pollTrainStatus() {
+  const s = await apiTrainStatus();
+  trainStatus = s.status;
+  if (s.progress) {
+    trainStep = s.progress.step ?? trainStep;
+    trainLoss = s.progress.loss ?? trainLoss;
+  }
+  if (s.result?.step !== undefined) trainStep = s.result.step;
+  if (s.result?.final_loss !== undefined) trainLoss = s.result.final_loss;
+  if (s.status === "running") {
+    trainPollTimer = setTimeout(pollTrainStatus, 2000);
+  } else if (s.status === "done") {
+    trainStep = trainSteps;
+    apiEmbeddingsList();
+    trainFolder = "";
+    trainName = "";
+  }
+}
+
+// fetch memory token info + embeddings list when model is loaded
+$effect(() => {
+  if (session.modelLoaded) {
+    apiMemtokInfo();
+    apiEmbeddingsList();
+    apiDecodeSettings();
+  }
+});
+// check if pre-encoded data exists when lora name changes
+$effect(() => {
+  if (loraName) checkEncodedStatus();
+});
 </script>
 
 <aside class="right-rail">
@@ -228,6 +415,10 @@ function setTargetFromSlider(e) {
         <label>Seed</label>
         <div class="seed-row">
           <input type="text" bind:value={session.seed} class="seed-input">
+          <button class="icon-btn" onclick={repeatSeed} title="Repeat last seed"
+                  disabled={session.lastSeed == null}>
+            <i class="bi bi-arrow-repeat"></i>
+          </button>
           <button class="icon-btn" onclick={rerollSeed} title="Random seed">
             <i class="bi bi-dice-5"></i>
           </button>
@@ -242,7 +433,9 @@ function setTargetFromSlider(e) {
       <div class="form-row" class:disabled={!session.hasAudio}>
         <label>BPM</label>
         <div class="tempo-row">
-          <span class="bpm-detected" title="Detected BPM">{session.bpm ? session.bpm.toFixed(1) : "—"}</span>
+          <span class="bpm-detected" title="{session.bpmSource === 'tag' ? 'From file metadata' : 'Detected'} BPM">{session.bpm ? session.bpm.toFixed(1) : "—"}</span>
+          <button class="btn-icon bpm-refresh" title="Re-detect BPM (ignore metadata)" onclick={() => apiRedetectBpm()}
+                  disabled={!session.hasAudio || tempoProcessing}><i class="bi bi-arrow-clockwise"></i></button>
           <i class="bi bi-arrow-right bpm-arrow"></i>
           <input type="number" class="bpm-input" bind:value={targetBpm}
                  placeholder={session.bpm ? session.bpm.toFixed(0) : "—"}
@@ -402,6 +595,165 @@ function setTargetFromSlider(e) {
           <span class="value">{session.durationPaddingSec.toFixed(1)}s</span>
         </div>
       </div>
+      <div class="subsection-label">Performance</div>
+      <div class="form-row">
+        <label>KV Cache</label>
+        <label class="toggle-sm">
+          <input type="checkbox" bind:checked={session.kvCache}>
+          <span>{session.kvCache ? "On" : "Off"}</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>ToMe Ratio</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="0.5" step="0.05" bind:value={session.tomeRatio} class="slider">
+          <span class="value">{session.tomeRatio.toFixed(2)}</span>
+        </div>
+      </div>
+
+      <div class="subsection-label">VAE Decode</div>
+      <div class="form-row">
+        <label>FP32 Decode</label>
+        <label class="toggle-sm">
+          <input type="checkbox" bind:checked={session.decodeFp32}
+                 onchange={() => apiSetDecodeSettings({ decode_fp32: session.decodeFp32 })}>
+          <span>{session.decodeFp32 ? "On" : "Off"}</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>Overlap</label>
+        <div class="slider-row">
+          <input type="range" min="0" max="128" step="8" bind:value={session.decodeOverlap} class="slider"
+                 onchange={() => apiSetDecodeSettings({ decode_overlap: session.decodeOverlap })}>
+          <span class="value">{session.decodeOverlap}</span>
+        </div>
+      </div>
+
+      {#if session.memtokAvailable}
+        <div class="subsection-label">Memory Tokens</div>
+        <div class="form-row">
+          <label>Strength</label>
+          <div class="slider-row">
+            <input type="range" min="0" max="3" step="0.05" value={session.memtokStrength}
+                   oninput={(e) => apiMemtokSet(parseFloat(e.target.value))} class="slider">
+            <span class="value">{session.memtokStrength.toFixed(2)}</span>
+          </div>
+        </div>
+        <div class="form-row memtok-actions">
+          <input type="text" class="bpm-input" bind:value={memtokSaveName} placeholder="preset name">
+          <button class="btn btn-sm" onclick={() => { apiMemtokAction("save", memtokSaveName || "custom"); memtokSaveName = ""; }}
+                  disabled={!memtokSaveName}>Save</button>
+          <button class="btn btn-sm" onclick={() => apiMemtokAction("reset")}>Reset</button>
+        </div>
+        {#if session.memtokPresets.length > 0}
+          <div class="form-row">
+            <label>Presets</label>
+            <div class="memtok-presets">
+              {#each session.memtokPresets as preset}
+                <button class="btn btn-sm" onclick={() => apiMemtokAction("load", preset)}>{preset}</button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      {/if}
+    {/snippet}
+  </Panel>
+
+  <Panel title="Embeddings" defaultOpen={false}>
+    {#snippet children()}
+      {#if session.embeddings.length > 0}
+        <div class="embed-hint">Use <code>&lt;name&gt;</code> or <code>&lt;name:0.8&gt;</code> for strength</div>
+        <div class="embed-list">
+          {#each session.embeddings as emb}
+            <div class="embed-item">
+              <code>&lt;{emb.name}&gt;</code>
+              <div class="embed-actions">
+                {#if emb.has_checkpoints}
+                  <button class="btn-icon" title="Edit checkpoint"
+                          onclick={() => openCheckpointEditor(emb.name)}>
+                    <i class="bi bi-pencil"></i>
+                  </button>
+                {/if}
+                <button class="btn-icon" title="Insert into prompt"
+                        onclick={() => { session.prompt += (session.prompt ? " " : "") + `<${emb.name}>`; }}>
+                  <i class="bi bi-plus-circle"></i>
+                </button>
+              </div>
+            </div>
+            {#if editingEmbed === emb.name}
+              <div class="ckpt-editor">
+                <select class="select" bind:value={selectedCkpt}>
+                  {#each checkpoints as ckpt}
+                    <option value={ckpt.file}>{ckpt.step} — {ckpt.loss.toFixed(4)}</option>
+                  {/each}
+                </select>
+                <button class="btn btn-sm" onclick={applySelectedCheckpoint}>Apply</button>
+              </div>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+      <div class="subsection-label">Train New</div>
+      <div class="form-row">
+        <label>Folder</label>
+        <div class="folder-row">
+          <input type="text" class="input-full" bind:value={trainFolder}
+                 placeholder="~/Music/artist-name" disabled={trainStatus === "running"}>
+          <button class="btn btn-sm" onclick={browseFolder}
+                  disabled={trainStatus === "running"} title="Browse…">
+            <i class="bi bi-folder2-open"></i>
+          </button>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" class="bpm-input" bind:value={trainName}
+               placeholder="trigger-name" disabled={trainStatus === "running"}
+               style="width: 100%">
+      </div>
+      <div class="form-row">
+        <label>Tokens</label>
+        <div class="slider-row">
+          <input type="range" min="1" max="16" step="1" bind:value={trainTokens} class="slider"
+                 disabled={trainStatus === "running"}>
+          <span class="value">{trainTokens}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Steps</label>
+        <div class="slider-row">
+          <input type="range" min="100" max="2000" step="50" bind:value={trainSteps} class="slider"
+                 disabled={trainStatus === "running"}>
+          <span class="value">{trainSteps}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Batch</label>
+        <select class="select" bind:value={trainBatch} disabled={trainStatus === "running"}>
+          <option value={0}>Auto</option>
+          <option value={1}>1</option>
+          <option value={2}>2</option>
+          <option value={4}>4</option>
+          <option value={8}>8</option>
+        </select>
+      </div>
+      <button class="btn btn-sm train-btn"
+              onclick={startTraining}
+              disabled={!trainFolder || !trainName || trainStatus === "running"}>
+        {#if trainStatus === "running"}
+          <i class="bi bi-hourglass-split"></i> Training…
+        {:else}
+          <i class="bi bi-lightning"></i> Train Embedding
+        {/if}
+      </button>
+      {#if trainStatus === "running" || trainStatus === "done"}
+        <div class="train-progress">
+          <div class="train-progress-bar">
+            <div class="train-progress-fill" style="width: {Math.min(100, trainStep / trainSteps * 100)}%"></div>
+          </div>
+          <span class="train-progress-text">{trainStep}/{trainSteps} · loss {trainLoss.toFixed(4)}</span>
+        </div>
+      {/if}
     {/snippet}
   </Panel>
   {/if}
@@ -441,6 +793,112 @@ function setTargetFromSlider(e) {
       {:else}
         <div class="lora-empty">drop a .safetensors here or click + to add</div>
       {/each}
+    </div>
+    <div class="subsection-label" style="padding: 0 var(--gap-2);">Train LoRA</div>
+    <div style="padding: 0 var(--gap-2);">
+      <div class="form-row">
+        <label>Folder</label>
+        <div class="folder-row">
+          <input type="text" class="input-full" bind:value={loraFolder}
+                 placeholder="~/Music/artist-name" disabled={loraStatus === "running"}>
+          <button class="btn btn-sm" onclick={browseLoraFolder}
+                  disabled={loraStatus === "running"} title="Browse…">
+            <i class="bi bi-folder2-open"></i>
+          </button>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" class="bpm-input" bind:value={loraName}
+               placeholder="lora-name" disabled={loraStatus === "running"} style="width: 100%">
+      </div>
+      <div class="form-row">
+        <label>Trigger</label>
+        <input type="text" class="input-full" bind:value={loraTrigger}
+               placeholder="single word (overrides caption)" disabled={loraStatus === "running"}>
+      </div>
+      <div class="form-row">
+        <label>Caption</label>
+        <input type="text" class="input-full" bind:value={loraCaption}
+               placeholder="style description (optional)" disabled={loraStatus === "running" || !!loraTrigger}>
+      </div>
+      <div class="form-row">
+        <label>Rank</label>
+        <select class="select" bind:value={loraRank} disabled={loraStatus === "running"}>
+          <option value={4}>4</option>
+          <option value={8}>8</option>
+          <option value={16}>16</option>
+          <option value={32}>32</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Adapter</label>
+        <select class="select" bind:value={loraAdapter} disabled={loraStatus === "running"}>
+          <option value="dora-rows">DoRA (recommended)</option>
+          <option value="lora">LoRA</option>
+          <option value="lora-xs">LoRA-XS (low VRAM)</option>
+          <option value="bora">BoRA</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Steps</label>
+        <div class="slider-row">
+          <input type="range" min="500" max="10000" step="100" bind:value={loraSteps} class="slider"
+                 disabled={loraStatus === "running"}>
+          <span class="value">{loraSteps}</span>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Batch</label>
+        <select class="select" bind:value={loraBatch} disabled={loraStatus === "running"}>
+          <option value={0}>Auto</option>
+          <option value={1}>1</option>
+          <option value={2}>2</option>
+          <option value={4}>4</option>
+          <option value={8}>8</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Compile</label>
+        <label class="toggle-sm">
+          <input type="checkbox" bind:checked={loraCompile}
+                 disabled={loraStatus === "running"}>
+          <span>{loraCompile ? "On" : "Off"}</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>Pre-encode</label>
+        <div class="pre-encode-row">
+          {#if hasEncoded}
+            <span class="encoded-badge">{encodedLatents} latents cached</span>
+          {:else if preEncodeStatus === "running"}
+            <span class="text-muted" style="font-size:11px">Encoding {preEncodeBatch}/{preEncodeTotal}…</span>
+          {:else}
+            <span class="text-muted" style="font-size:11px">Not cached</span>
+          {/if}
+          <button class="btn btn-sm" onclick={startPreEncode}
+                  disabled={!loraFolder || !loraName || preEncodeStatus === "running" || loraStatus === "running"}>
+            {preEncodeStatus === "running" ? "…" : hasEncoded ? "Re-encode" : "Encode"}
+          </button>
+        </div>
+      </div>
+      <button class="btn btn-sm train-btn"
+              onclick={startLoraTraining}
+              disabled={!loraFolder || !loraName || loraStatus === "running"}>
+        {#if loraStatus === "running"}
+          <i class="bi bi-hourglass-split"></i> Training LoRA…
+        {:else}
+          <i class="bi bi-lightning"></i> Train LoRA
+        {/if}
+      </button>
+      {#if loraStatus === "running" || loraStatus === "done"}
+        <div class="train-progress">
+          <div class="train-progress-bar">
+            <div class="train-progress-fill" style="width: {Math.min(100, loraStep / loraSteps * 100)}%"></div>
+          </div>
+          <span class="train-progress-text">{loraStep}/{loraSteps} · loss {loraLoss.toFixed(4)}</span>
+        </div>
+      {/if}
     </div>
   </section>
 
@@ -649,6 +1107,17 @@ function setTargetFromSlider(e) {
   color: var(--text-secondary);
   min-width: 36px;
 }
+.bpm-refresh {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1;
+}
+.bpm-refresh:hover { color: var(--accent-blue); }
+.bpm-refresh[disabled] { opacity: 0.3; cursor: default; }
 .bpm-arrow {
   font-size: 10px;
   color: var(--text-muted);
@@ -675,4 +1144,119 @@ function setTargetFromSlider(e) {
 }
 .btn-sm:hover:not(:disabled) { background: var(--code-highlight); }
 .btn-sm:disabled { opacity: 0.4; }
+.subsection-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-top: var(--gap-3);
+  padding-bottom: var(--gap-1);
+  border-bottom: 1px solid var(--border-color);
+}
+.toggle-sm {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.toggle-sm input { margin: 0; }
+.memtok-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+}
+.memtok-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-1);
+}
+.embed-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 0 var(--gap-2);
+}
+.embed-hint code { color: var(--accent-blue); }
+.embed-list { display: flex; flex-direction: column; gap: var(--gap-1); padding: var(--gap-2); }
+.embed-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+.embed-item code { color: var(--accent-blue); font-size: 11px; }
+.embed-actions { display: flex; gap: var(--gap-1); align-items: center; }
+.ckpt-editor {
+  display: flex;
+  gap: var(--gap-2);
+  align-items: center;
+  padding-left: var(--gap-3);
+}
+.ckpt-editor .select {
+  flex: 1;
+  background: var(--code-block);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  padding: 2px 4px;
+  font-size: 11px;
+  min-width: 0;
+}
+.input-full {
+  background: var(--code-block);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  padding: 3px 6px;
+  font-size: 12px;
+  width: 100%;
+}
+.input-full:focus { outline: 1px solid var(--accent-blue); border-color: transparent; }
+.folder-row {
+  display: flex;
+  gap: var(--gap-1);
+  align-items: center;
+  width: 100%;
+}
+.folder-row .input-full { flex: 1; min-width: 0; }
+.train-btn {
+  width: 100%;
+  margin-top: var(--gap-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--gap-2);
+}
+.train-progress {
+  margin-top: var(--gap-2);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.train-progress-bar {
+  height: 4px;
+  background: var(--code-block);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.train-progress-fill {
+  height: 100%;
+  background: var(--accent-blue);
+  transition: width 0.3s ease;
+}
+.train-progress-text {
+  font-size: 10px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.pre-encode-row {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  justify-content: space-between;
+}
+.encoded-badge {
+  font-size: 10px;
+  color: var(--success-green);
+  font-variant-numeric: tabular-nums;
+}
 </style>

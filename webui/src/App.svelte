@@ -1,6 +1,6 @@
 <script>
 import { onMount } from "svelte";
-import { session, apiState, apiUpload, apiGenerate } from "./lib/session.svelte.js";
+import { session, apiState, apiUpload, apiGenerate, apiUndo, apiRedo } from "./lib/session.svelte.js";
 import TopBar from "./lib/TopBar.svelte";
 import OverviewWave from "./lib/OverviewWave.svelte";
 import TimeAxis from "./lib/TimeAxis.svelte";
@@ -8,9 +8,11 @@ import MainCanvas from "./lib/MainCanvas.svelte";
 import RightRail from "./lib/RightRail.svelte";
 import BottomBar from "./lib/BottomBar.svelte";
 import Toast from "./lib/Toast.svelte";
+import HelpOverlay from "./lib/HelpOverlay.svelte";
 
 let audioEl = $state(null);
 let isDragOver = $state(false);
+let helpOpen = $state(false);
 
 // Web Audio graph for live volume + masked-region ducking
 let audioCtx = null;
@@ -59,10 +61,12 @@ function onKeyDown(e) {
     apiGenerate().catch(console.error);
   } else if (mod && e.shiftKey && e.key === "Z") {
     e.preventDefault();
-    session.redoMask();
+    const type = session.redo();
+    if (type === "audio") apiRedo().catch(console.error);
   } else if (mod && e.key === "z") {
     e.preventDefault();
-    session.undoMask();
+    const type = session.undo();
+    if (type === "audio") apiUndo().catch(console.error);
   } else if (mod && e.key === "a") {
     e.preventDefault();
     const N = session.latentCount;
@@ -79,6 +83,9 @@ function onKeyDown(e) {
       ? session.downsampleRatio / session.sampleRate / session.trackSeconds
       : 0;
     session.playhead = Math.min(1, session.playhead + step);
+  } else if (e.key === "?") {
+    e.preventDefault();
+    helpOpen = !helpOpen;
   }
 }
 
@@ -266,6 +273,7 @@ onMount(() => {
   {/if}
 
   <Toast />
+  <HelpOverlay bind:visible={helpOpen} />
 </div>
 
 <audio

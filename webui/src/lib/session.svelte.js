@@ -26,6 +26,7 @@ class Session {
   version = $state(0); // bumped by backend on every change; bust caches
   hasAudio = $state(false);
   bpm = $state(null);
+  bpmSource = $state(""); // "tag" or "detect"
 
   // mask is the single source of truth for what's painted
   mask = $state(new Uint8Array(0));
@@ -51,6 +52,7 @@ class Session {
   cfg = $state(1.0);
   noise = $state(0.65);
   seed = $state(-1);
+  lastSeed = $state(null);
   duration = $state(190); // text-to-audio length (sec)
   samplerType = $state("");
   apgScale = $state(1.0);
@@ -73,7 +75,23 @@ class Session {
   distShiftBaseShift = $state(0.5);
   distShiftMaxShift = $state(1.15);
 
+  // speedups
+  kvCache = $state(false);
+  tomeRatio = $state(0.0);
+
+  // decode quality
+  decodeFp32 = $state(true);
+  decodeOverlap = $state(32);
+
   loras = $state([]);
+
+  // memory tokens
+  memtokAvailable = $state(false);
+  memtokStrength = $state(1.0);
+  memtokPresets = $state([]);
+
+  // embeddings
+  embeddings = $state([]); // available embedding files
 
   // variant history
   variants = $state([]); // array of { version, prompt, seed }
@@ -95,7 +113,10 @@ class Session {
     this.variantIndex = this.variants.length - 1;
   }
 
-  precision = $state("fp16");
+  canUndo = $state(false);
+  canRedo = $state(false);
+
+  precision = $state("fp32");
   generating = $state(false);
   scrubbingNoise = $state(false);
   modelLoaded = $state(false);
@@ -125,26 +146,55 @@ class Session {
     this.mask = next;
   }
 
-  _maskHistory = [];
-  _maskRedoStack = [];
-  _pushMaskHistory() {
-    this._maskHistory.push(new Uint8Array(this.mask));
-    if (this._maskHistory.length > 50) this._maskHistory.shift();
-    this._maskRedoStack = [];
+  // unified undo stack: entries are { type: "mask" | "audio" }
+  // mask entries store the mask snapshot; audio entries are handled by the backend
+  _undoStack = [];
+  _redoStack = [];
+
+  _pushMaskUndo() {
+    this._undoStack.push({ type: "mask", mask: new Uint8Array(this.mask) });
+    if (this._undoStack.length > 50) this._undoStack.shift();
+    this._redoStack = [];
   }
-  undoMask() {
-    if (this._maskHistory.length === 0) return;
-    this._maskRedoStack.push(new Uint8Array(this.mask));
-    this.mask = this._maskHistory.pop();
+  pushAudioMarker() {
+    this._undoStack.push({ type: "audio" });
+    if (this._undoStack.length > 50) this._undoStack.shift();
+    this._redoStack = [];
   }
-  redoMask() {
-    if (this._maskRedoStack.length === 0) return;
-    this._maskHistory.push(new Uint8Array(this.mask));
-    this.mask = this._maskRedoStack.pop();
+
+  // returns the type of the entry undone ("mask" | "audio" | null)
+  undo() {
+    if (this._undoStack.length === 0) return null;
+    const entry = this._undoStack.pop();
+    if (entry.type === "mask") {
+      this._redoStack.push({ type: "mask", mask: new Uint8Array(this.mask) });
+      this.mask = entry.mask;
+      return "mask";
+    }
+    this._redoStack.push({ type: "audio" });
+    return "audio";
+  }
+  redo() {
+    if (this._redoStack.length === 0) return null;
+    const entry = this._redoStack.pop();
+    if (entry.type === "mask") {
+      this._undoStack.push({ type: "mask", mask: new Uint8Array(this.mask) });
+      this.mask = entry.mask;
+      return "mask";
+    }
+    this._undoStack.push({ type: "audio" });
+    return "audio";
+  }
+
+  get canUndoAnything() {
+    return this._undoStack.length > 0 || this.canUndo;
+  }
+  get canRedoAnything() {
+    return this._redoStack.length > 0 || this.canRedo;
   }
 
   paint(startLatent, endLatent, mode) {
-    this._pushMaskHistory();
+    this._pushMaskUndo();
     if (endLatent < startLatent)
       [startLatent, endLatent] = [endLatent, startLatent];
     startLatent = Math.max(0, Math.floor(startLatent));
@@ -210,9 +260,26 @@ export async function apiUpload(file) {
     session.setTrackInfo(j);
     session.duration = Math.round(j.duration);
     if (j.bpm != null) session.bpm = j.bpm;
+    if (j.bpm_source) session.bpmSource = j.bpm_source;
+    session.pushAudioMarker();
+    session.canUndo = true;
+    session.canRedo = false;
     return j;
   } catch (e) {
     toasts.error("Upload failed: " + e.message);
+  }
+}
+
+export async function apiRedetectBpm() {
+  try {
+    const r = await fetch("/api/detect_bpm", { method: "POST" });
+    if (!r.ok) throw new Error("BPM detect failed: " + r.status);
+    const j = await r.json();
+    session.bpm = j.bpm;
+    session.bpmSource = j.bpm_source;
+    return j;
+  } catch (e) {
+    toasts.error("BPM detection failed: " + e.message);
   }
 }
 
@@ -227,12 +294,14 @@ export async function apiClear() {
   return j;
 }
 
-export async function apiTempo(factor) {
+export async function apiTempo(factor, targetBpm = null) {
   try {
+    const payload = { factor };
+    if (targetBpm) payload.target_bpm = targetBpm;
     const r = await fetch("/api/tempo", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ factor }),
+      body: JSON.stringify(payload),
     });
     if (!r.ok) throw new Error("tempo change failed: " + r.status);
     const j = await r.json();
@@ -240,6 +309,9 @@ export async function apiTempo(factor) {
     session.setTrackInfo(j);
     session.mask = new Uint8Array(session.mask.length > 0 ? j.count : 0);
     if (j.bpm != null) session.bpm = j.bpm;
+    session.pushAudioMarker();
+    session.canUndo = true;
+    session.canRedo = false;
     toasts.success(`Tempo ×${factor.toFixed(2)}`);
     return j;
   } catch (e) {
@@ -302,6 +374,8 @@ export async function apiGenerate() {
               dist_shift_max_shift: session.distShiftMaxShift,
             }
           : {}),
+        kvCache: session.kvCache,
+        tomeRatio: session.tomeRatio,
       },
     };
     const r = await fetch("/api/generate", {
@@ -316,12 +390,16 @@ export async function apiGenerate() {
     session.version = j.version;
     session.setTrackInfo(j);
     if (j.bpm != null) session.bpm = j.bpm;
+    if (j.seed != null) session.lastSeed = j.seed;
     session.pushVariant();
     // remember the inpainted regions as ghost (visual recall), then clear the live mask
     if (body.mask.some((v) => v)) {
       session.ghostMask = new Uint8Array(body.mask);
     }
     session.mask = new Uint8Array(session.mask.length);
+    session.pushAudioMarker();
+    session.canUndo = true;
+    session.canRedo = false;
     toasts.success("Generation complete");
     return j;
   } catch (e) {
@@ -330,5 +408,285 @@ export async function apiGenerate() {
   } finally {
     _genAbort = null;
     session.generating = false;
+  }
+}
+
+export async function apiUndo() {
+  try {
+    const r = await fetch("/api/undo", { method: "POST" });
+    if (!r.ok) throw new Error("undo failed: " + r.status);
+    const j = await r.json();
+    session.hasAudio = true;
+    session.version = j.version;
+    session.setTrackInfo(j);
+    if (j.bpm != null) session.bpm = j.bpm;
+    session.canUndo = j.can_undo;
+    session.canRedo = j.can_redo;
+    session.mask = new Uint8Array(session.mask.length);
+    session.ghostMask = new Uint8Array(session.ghostMask.length);
+    return j;
+  } catch (e) {
+    toasts.error("Undo failed: " + e.message);
+  }
+}
+
+export async function apiRedo() {
+  try {
+    const r = await fetch("/api/redo", { method: "POST" });
+    if (!r.ok) throw new Error("redo failed: " + r.status);
+    const j = await r.json();
+    session.hasAudio = true;
+    session.version = j.version;
+    session.setTrackInfo(j);
+    if (j.bpm != null) session.bpm = j.bpm;
+    session.canUndo = j.can_undo;
+    session.canRedo = j.can_redo;
+    session.mask = new Uint8Array(session.mask.length);
+    session.ghostMask = new Uint8Array(session.ghostMask.length);
+    return j;
+  } catch (e) {
+    toasts.error("Redo failed: " + e.message);
+  }
+}
+
+// -------- memory tokens --------
+
+export async function apiMemtokInfo() {
+  try {
+    const r = await fetch("/api/memory_tokens");
+    const j = await r.json();
+    session.memtokAvailable = j.available;
+    session.memtokStrength = j.strength ?? 1.0;
+    session.memtokPresets = j.presets ?? [];
+    return j;
+  } catch (e) {
+    console.warn("memtok info failed:", e);
+  }
+}
+
+export async function apiMemtokSet(strength) {
+  try {
+    const r = await fetch("/api/memory_tokens", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ strength, action: "set" }),
+    });
+    const j = await r.json();
+    session.memtokStrength = j.strength;
+  } catch (e) {
+    toasts.error("Memory token update failed: " + e.message);
+  }
+}
+
+export async function apiMemtokAction(action, name = null) {
+  try {
+    const r = await fetch("/api/memory_tokens", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, name, preset: name }),
+    });
+    const j = await r.json();
+    if (j.strength != null) session.memtokStrength = j.strength;
+    if (action === "save") toasts.success(`Saved memory tokens: ${name}`);
+    if (action === "load") toasts.success(`Loaded memory tokens: ${name}`);
+    if (action === "reset") toasts.success("Memory tokens reset");
+    await apiMemtokInfo();
+    return j;
+  } catch (e) {
+    toasts.error(`Memory token ${action} failed: ` + e.message);
+  }
+}
+
+// -------- decode settings --------
+
+export async function apiDecodeSettings() {
+  try {
+    const r = await fetch("/api/decode_settings");
+    const j = await r.json();
+    session.decodeFp32 = j.decode_fp32;
+    session.decodeOverlap = j.decode_overlap;
+    return j;
+  } catch (e) {
+    console.warn("decode settings fetch failed:", e);
+  }
+}
+
+export async function apiSetDecodeSettings(opts) {
+  try {
+    const r = await fetch("/api/decode_settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(opts),
+    });
+    const j = await r.json();
+    session.decodeFp32 = j.decode_fp32;
+    session.decodeOverlap = j.decode_overlap;
+  } catch (e) {
+    console.warn("decode settings update failed:", e);
+  }
+}
+
+// -------- embeddings --------
+
+export async function apiEmbeddingsList() {
+  try {
+    const r = await fetch("/api/embeddings");
+    const j = await r.json();
+    session.embeddings = j.files ?? [];
+    return j;
+  } catch (e) {
+    console.warn("embeddings list failed:", e);
+  }
+}
+
+export async function apiEmbeddingCheckpoints(name) {
+  try {
+    const r = await fetch(
+      `/api/embeddings/${encodeURIComponent(name)}/checkpoints`,
+    );
+    return await r.json();
+  } catch (e) {
+    console.warn("checkpoints list failed:", e);
+    return { checkpoints: [] };
+  }
+}
+
+export async function apiApplyCheckpoint(name, file) {
+  const r = await fetch(
+    `/api/embeddings/${encodeURIComponent(name)}/apply_checkpoint`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file }),
+    },
+  );
+  if (!r.ok) throw new Error("apply checkpoint failed: " + r.status);
+  return await r.json();
+}
+
+export async function apiTrainEmbedding(
+  folder,
+  name,
+  tokens = 4,
+  steps = 500,
+  batch_size = 0,
+) {
+  try {
+    const r = await fetch("/api/train_embedding", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ folder, name, tokens, steps, batch_size }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(err);
+    }
+    const j = await r.json();
+    toasts.success(`Training started: ${name}`);
+    return j;
+  } catch (e) {
+    toasts.error("Train failed: " + e.message);
+  }
+}
+
+export async function apiTrainStatus() {
+  try {
+    const r = await fetch("/api/train_embedding/status");
+    return await r.json();
+  } catch (e) {
+    return { status: "error", error: e.message };
+  }
+}
+
+export async function apiTrainLora(opts) {
+  try {
+    const r = await fetch("/api/train_lora", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(opts),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(err);
+    }
+    const j = await r.json();
+    toasts.success(`LoRA training started: ${opts.name}`);
+    return j;
+  } catch (e) {
+    toasts.error("LoRA train failed: " + e.message);
+  }
+}
+
+export async function apiPreEncode(folder, name, caption) {
+  try {
+    const r = await fetch("/api/pre_encode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ folder, name, caption }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      throw new Error(err);
+    }
+    const j = await r.json();
+    toasts.success(`Pre-encoding started: ${name}`);
+    return j;
+  } catch (e) {
+    toasts.error("Pre-encode failed: " + e.message);
+  }
+}
+
+export async function apiPreEncodeStatus() {
+  try {
+    const r = await fetch("/api/pre_encode/status");
+    return await r.json();
+  } catch (e) {
+    return { status: "error", error: e.message };
+  }
+}
+
+export async function apiCheckEncoded(name) {
+  try {
+    const r = await fetch(
+      `/api/lora_training/${encodeURIComponent(name)}/has_encoded`,
+    );
+    return await r.json();
+  } catch (e) {
+    return { has_encoded: false, latents: 0 };
+  }
+}
+
+export async function apiLoraTrainStatus() {
+  try {
+    const r = await fetch("/api/train_lora/status");
+    return await r.json();
+  } catch (e) {
+    return { status: "error", error: e.message };
+  }
+}
+
+export async function apiGetSettings() {
+  try {
+    const r = await fetch("/api/settings");
+    return await r.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function apiSaveSettings(settings) {
+  try {
+    const r = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(settings),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    toasts.success("Settings saved");
+    return j;
+  } catch (e) {
+    toasts.error("Settings save failed: " + e.message);
+    return null;
   }
 }
