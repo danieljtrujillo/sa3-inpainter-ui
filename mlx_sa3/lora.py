@@ -256,18 +256,23 @@ def inject_lora(
 
     count = 0
 
+    # NOTE: mlx.nn.Module subclasses `dict`, so attributes set via __setattr__
+    # are stored as DICT ITEMS, not in __dict__. The previous version walked
+    # via vars(parent).keys() which only sees non-Module instance attributes,
+    # missing every submodule and silently injecting zero adapters. Walk the
+    # dict items directly instead.
     def _inject_recursive(parent, parent_path: str):
         nonlocal count
-        for name in list(vars(parent).keys()):
-            child = getattr(parent, name)
+        items = list(parent.items()) if isinstance(parent, nn.Module) else []
+        for name, child in items:
             child_path = f"{parent_path}.{name}" if parent_path else name
 
             if isinstance(child, nn.Linear) and _should_inject(child_path, include, exclude):
-                setattr(parent, name, make_linear(child, rank, alpha))
+                parent[name] = make_linear(child, rank, alpha)
                 count += 1
             elif isinstance(child, nn.Conv1d) and _should_inject(child_path, include, exclude):
                 try:
-                    setattr(parent, name, make_conv1d(child, rank, alpha))
+                    parent[name] = make_conv1d(child, rank, alpha)
                     count += 1
                 except AssertionError:
                     pass
@@ -287,6 +292,20 @@ def inject_lora(
                             pass
                     elif isinstance(item, nn.Module):
                         _inject_recursive(item, item_path)
+            elif isinstance(child, dict):
+                for k, v in list(child.items()):
+                    item_path = f"{child_path}.{k}"
+                    if isinstance(v, nn.Linear) and _should_inject(item_path, include, exclude):
+                        child[k] = make_linear(v, rank, alpha)
+                        count += 1
+                    elif isinstance(v, nn.Conv1d) and _should_inject(item_path, include, exclude):
+                        try:
+                            child[k] = make_conv1d(v, rank, alpha)
+                            count += 1
+                        except AssertionError:
+                            pass
+                    elif isinstance(v, nn.Module):
+                        _inject_recursive(v, item_path)
 
     _inject_recursive(model, "")
     return count

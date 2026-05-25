@@ -34,6 +34,14 @@ import { toasts } from "./toast.svelte.js";
   pointer-events: auto;
   animation: slideIn 0.2s ease-out;
   box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  max-width: 560px;
+}
+.toast span {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+  word-break: break-word;
+  white-space: pre-wrap;
 }
 .toast.error {
   background: #3d1f1f;

@@ -1,5 +1,5 @@
 <script>
-import { onMount } from "svelte";
+import { onMount, untrack } from "svelte";
 import { session, apiState, apiUpload, apiGenerate, apiUndo, apiRedo } from "./lib/session.svelte.js";
 import TopBar from "./lib/TopBar.svelte";
 import OverviewWave from "./lib/OverviewWave.svelte";
@@ -9,6 +9,8 @@ import RightRail from "./lib/RightRail.svelte";
 import BottomBar from "./lib/BottomBar.svelte";
 import Toast from "./lib/Toast.svelte";
 import HelpOverlay from "./lib/HelpOverlay.svelte";
+import SettingsView from "./lib/SettingsView.svelte";
+import TrainerView from "./lib/TrainerView.svelte";
 
 let audioEl = $state(null);
 let isDragOver = $state(false);
@@ -39,8 +41,9 @@ function ensureAudioGraph() {
   } catch (e) { console.warn("audio graph init failed:", e); }
 }
 
-// keyboard shortcuts
+// keyboard shortcuts (inpainter tab only — other tabs own their own keys)
 function onKeyDown(e) {
+  if (session.activeTab !== "inpainter") return;
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
   const mod = e.ctrlKey || e.metaKey;
@@ -51,6 +54,12 @@ function onKeyDown(e) {
     if (session.hasMask) {
       e.preventDefault();
       session.clearMask();
+    }
+  } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    if (session.hasAudio) {
+      e.preventDefault();
+      const step = e.shiftKey ? 10 : 1;     // shift = 10× jump
+      session.movePlayheadLatents(e.key === "ArrowLeft" ? -step : +step);
     }
   } else if (mod && e.key === "g") {
     e.preventDefault();
@@ -100,12 +109,15 @@ async function onDrop(e) {
 }
 
 // playback wiring: session.playing ↔ audio element
+// note: on HMR the audio element is recreated empty, so we defer play() until
+// the swap effect has restored the src (it will resume because wasPlaying=session.playing).
 $effect(() => {
   if (!audioEl) return;
   if (session.playing) {
+    if (!audioEl.src) return;
     ensureAudioGraph();
     if (audioCtx?.state === "suspended") audioCtx.resume();
-    audioEl.play().catch(() => session.playing = false);
+    audioEl.play().catch(() => {});
   } else {
     audioEl.pause();
   }
@@ -130,7 +142,9 @@ $effect(() => {
   if (!audioEl) return;
   session.version;
   if (!session.hasAudio) { audioEl.src = ""; return; }
-  const wasPlaying = !audioEl.paused;
+  // peek without subscribing — otherwise pause/play would re-trigger this effect
+  // and reload the audio src (which snaps currentTime back to 0).
+  const wasPlaying = untrack(() => session.playing);
   const t = audioEl.currentTime || 0;
   const onReady = () => {
     audioEl.removeEventListener("loadedmetadata", onReady);
@@ -232,7 +246,7 @@ onMount(() => {
   window.addEventListener("keydown", onKeyDown);
   apiState();
   pollStats();
-  statsInterval = setInterval(pollStats, 2000);
+  statsInterval = setInterval(pollStats, 1000);
   return () => {
     window.removeEventListener("keydown", onKeyDown);
     if (rafHandle) cancelAnimationFrame(rafHandle);
@@ -249,16 +263,24 @@ onMount(() => {
   ondrop={onDrop}
 >
   <TopBar />
-  <main class="editor">
-    <section class="canvas-column">
-      <OverviewWave />
-      <div class="spacer"></div>
-      <TimeAxis />
-      <MainCanvas />
-      <div class="spacer"></div>
-    </section>
-    <RightRail />
-  </main>
+  {#if session.activeTab === "inpainter"}
+    <main class="editor">
+      <section class="canvas-column">
+        <div class="spacer"></div>     <!-- push zoom bar down off the header -->
+        <OverviewWave />
+        <div class="spacer"></div>     <!-- tiny gap to playbar -->
+        <TimeAxis />
+        <div class="spacer"></div>     <!-- 10px above spectrogram -->
+        <MainCanvas />
+        <div class="spacer"></div>     <!-- 10px below colored wave -->
+      </section>
+      <RightRail />
+    </main>
+  {:else if session.activeTab === "trainer"}
+    <main class="single-pane"><TrainerView /></main>
+  {:else if session.activeTab === "settings"}
+    <main class="single-pane"><SettingsView /></main>
+  {/if}
   <BottomBar />
 
   {#if session.generating}
@@ -292,28 +314,32 @@ onMount(() => {
 .editor {
   display: grid;
   grid-template-columns: 1fr var(--rail-w);
-  column-gap: var(--gap-1);    /* tiny breathing room before the sidebar */
+  column-gap: 0;
   overflow: hidden;
   min-height: 0;
 }
+.single-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+  background: var(--bg-dark);
+}
 .canvas-column {
   display: grid;
-  grid-template-rows: 32px var(--main-margin) 44px 1fr var(--main-margin);
+  /* equal-gap zoom bar, playbar, 10px, spec, room for playhead-time label */
+  grid-template-rows: 16px 32px 16px 44px 10px 1fr 32px;
   background: var(--bg-dark);
   overflow: visible;       /* let the playhead-time label flow into the bottom spacer */
   min-height: 0;
   min-width: 0;
 }
 .spacer { background: var(--bg-dark); }
-/* every row gets left+right indents, EXCEPT the time-axis (3rd row) which is
-   edge-to-edge so the grey playbar strip extends to both screen edges */
+/* every row gets the same 8px inset so the playbar strip, zoom rect, and
+   spectrogram start at the same x-position when zoomed to 100% */
 .canvas-column > :global(*) {
   padding-left: var(--gap-2);
   padding-right: var(--gap-2);
-}
-.canvas-column > :global(*:nth-child(3)) {
-  padding-left: 0;
-  padding-right: 0;
 }
 
 .generating-overlay {

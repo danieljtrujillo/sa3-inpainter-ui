@@ -13,7 +13,7 @@ let dragMode = null;          // 'pan' | 'resizeL' | 'resizeR' | null
 let dragStartX = 0;
 let dragStartZoom = null;
 const EDGE_PX = 6;
-const INSET_PX = 10;     // visual inset so the zoom-rect handles don't sit at the screen edge
+const INSET_PX = 0;      // canvas-column already insets the navbar; keep content edge-to-edge inside it
 
 function draw() {
   if (!canvas) return;

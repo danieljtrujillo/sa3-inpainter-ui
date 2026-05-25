@@ -1,40 +1,19 @@
 <script>
 import { session } from "./session.svelte.js";
 
-const NICE_INTERVALS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
-
-function fmtTickLabel(t, interval) {
-  if (interval < 1) {
-    const m = Math.floor(t / 60);
-    const s = t - m * 60;
-    return `${m}:${s.toFixed(interval < 0.5 ? 2 : 1).padStart(interval < 0.5 ? 5 : 4, '0')}`;
-  }
-  const m = Math.floor(t / 60);
-  const s = Math.round(t - m * 60);
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
+const N_TICKS = 10;
 
 let ticks = $derived.by(() => {
-  const span = session.zoomEnd - session.zoomStart;
-  const visDur = span * session.trackSeconds;
-  if (visDur <= 0) return [];
-
-  // pick interval that gives ~8-15 ticks
-  let interval = NICE_INTERVALS[NICE_INTERVALS.length - 1];
-  for (const iv of NICE_INTERVALS) {
-    if (visDur / iv <= 15) { interval = iv; break; }
+  const span = (session.zoomEnd - session.zoomStart) * session.trackSeconds;
+  const start = session.zoomStart * session.trackSeconds;
+  const out = [];
+  for (let i = 0; i < N_TICKS; i++) {
+    const t = start + (i / (N_TICKS - 1)) * span;
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t - m * 60);
+    out.push(`${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`);
   }
-
-  const startT = session.zoomStart * session.trackSeconds;
-  const endT = session.zoomEnd * session.trackSeconds;
-  const firstTick = Math.ceil(startT / interval) * interval;
-
-  const result = [];
-  for (let t = firstTick; t <= endT; t += interval) {
-    const norm = (t - startT) / visDur;
-    result.push({ pct: norm * 100, label: fmtTickLabel(t, interval) });
-  }
-  return result;
+  return out;
 });
 
 let strip = $state(null);
@@ -62,12 +41,12 @@ function onPointerDown(e) {
   if (e.button !== 0) return;
   if (!session.hasAudio) return;
   scrubbing = true;
-  session.playhead = xToTimeNorm(e.clientX);
+  session.snapPlayhead(xToTimeNorm(e.clientX));
   strip.setPointerCapture?.(e.pointerId);
 }
 function onPointerMove(e) {
   if (!scrubbing) return;
-  session.playhead = xToTimeNorm(e.clientX);
+  session.snapPlayhead(xToTimeNorm(e.clientX));
 }
 function onPointerUp(e) {
   scrubbing = false;
@@ -86,12 +65,13 @@ function onPointerUp(e) {
     onpointercancel={onPointerUp}
   >
     {#each ticks as t, i}
-      <span class="tick-label" style="left: {t.pct}%">{t.label}</span>
-      <span class="tick-mark major" style="left: {t.pct}%"></span>
-      {#if i < ticks.length - 1}
+      {@const pct = (i / (N_TICKS - 1)) * 100}
+      <span class="tick-label" style="left: {pct}%">{t}</span>
+      <span class="tick-mark major" style="left: {pct}%"></span>
+      {#if i < N_TICKS - 1}
         {#each [0.2, 0.4, 0.6, 0.8] as sub}
           <span class="tick-mark minor"
-            style="left: {t.pct + sub * (ticks[i + 1].pct - t.pct)}%"></span>
+            style="left: {pct + sub * (100 / (N_TICKS - 1))}%"></span>
         {/each}
       {/if}
     {/each}

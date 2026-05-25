@@ -71,12 +71,12 @@ input, select, textarea { font: inherit; color: inherit; }
   gap: var(--gap-2);
   padding: 8px var(--gap-3);
   font-size: 12px;
-  border: 1px solid var(--border-color);
-  background: var(--code-block);
+  border: 1px solid #2c2c2c;
+  background: #1a1a1a;
   color: var(--text-primary);
   cursor: pointer;
 }
-.btn:hover { background: var(--code-highlight); }
+.btn:hover { background: #262626; border-color: #3a3a3a; }
 .btn-ghost { background: transparent; border: 0; color: var(--text-secondary); }
 .btn-ghost:hover { color: var(--text-primary); background: var(--code-highlight); }
 .btn-primary {

@@ -72,6 +72,9 @@ def encode_audio_files(
     print(json.dumps({"status": "loading_encoder", "weights": str(enc_path)}), flush=True)
     encoder = load_encoder(enc_path, dtype=mx.float32)
     mx.eval(encoder.parameters())
+    # Total file count up-front so the frontend can show a meaningful progress
+    # bar before the first file finishes encoding.
+    print(json.dumps({"status": "start", "total": len(files)}), flush=True)
 
     # Patched pretransform params for sa3-medium
     patch_size = 256
@@ -129,11 +132,8 @@ def encode_audio_files(
         x = x.transpose(0, 1, 3, 2)  # [1, 2, 256, T]
         x = x.reshape(B, C * patch_size, T_patches)  # [1, 512, T]
 
-        # Encode through SAME-L
-        # encoder expects channels-last: [B, T, 512]
-        x_cl = x.transpose(0, 2, 1)  # [1, T, 512]
-        latent_cl = encoder(x_cl)  # [1, T_lat, 256]
-        latent = latent_cl.transpose(0, 2, 1)  # [1, 256, T_lat]
+        # Encode through SAME-L (channels-first: [B, 512, T_audio_patches])
+        latent = encoder(x)  # [B, 256, T_lat]
 
         mx.eval(latent)
         latent_np = np.array(latent[0]).astype(np.float16)  # [256, T_lat]
@@ -156,6 +156,8 @@ def encode_audio_files(
         print(json.dumps({
             "status": "encoded",
             "idx": idx,
+            "batch": idx + 1,
+            "total": len(files),
             "file": audio_path.name,
             "shape": list(latent_np.shape),
             "seconds": round(total_seconds, 1),

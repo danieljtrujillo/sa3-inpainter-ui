@@ -43,6 +43,7 @@ class Session {
   volume = $state(0.7); // 0..1
   visMode = $state("both");
   advancedMode = $state(false);
+  activeTab = $state("inpainter"); // "inpainter" | "trainer" | "settings"
 
   // prompt + settings
   prompt = $state("");
@@ -90,8 +91,6 @@ class Session {
   memtokStrength = $state(1.0);
   memtokPresets = $state([]);
 
-  // embeddings
-  embeddings = $state([]); // available embedding files
 
   // variant history
   variants = $state([]); // array of { version, prompt, seed }
@@ -208,6 +207,27 @@ class Session {
 
   clearMask() {
     this.mask = new Uint8Array(this.mask.length);
+    this.ghostMask = new Uint8Array(this.ghostMask.length);
+  }
+
+  // Snap a normalized [0,1] playhead to the START of a latent (its left edge).
+  // Track is divided into N slots [i/N, (i+1)/N); the playhead lands on i/N.
+  // Used by user-input paths (clicks, drags, arrow keys). The audio-tick
+  // effect in App.svelte bypasses this and updates playhead continuously
+  // during playback.
+  snapPlayhead(norm) {
+    const N = this.latentCount;
+    if (!N || N <= 1) { this.playhead = Math.max(0, Math.min(1, norm)); return; }
+    const idx = Math.max(0, Math.min(N - 1, Math.floor(norm * N)));
+    this.playhead = idx / N;
+  }
+
+  movePlayheadLatents(delta) {
+    const N = this.latentCount;
+    if (!N || N <= 1) return;
+    const cur = Math.max(0, Math.min(N - 1, Math.floor(this.playhead * N)));
+    const next = Math.max(0, Math.min(N - 1, cur + delta));
+    this.playhead = next / N;
   }
 }
 
@@ -259,6 +279,9 @@ export async function apiUpload(file) {
     session.version = j.version;
     session.setTrackInfo(j);
     session.duration = Math.round(j.duration);
+    session.zoomStart = 0;
+    session.zoomEnd = 1;
+    session.playhead = 0;
     if (j.bpm != null) session.bpm = j.bpm;
     if (j.bpm_source) session.bpmSource = j.bpm_source;
     session.pushAudioMarker();
@@ -291,6 +314,9 @@ export async function apiClear() {
   session.mask = new Uint8Array(0);
   session.ghostMask = new Uint8Array(0);
   session.trackSeconds = 0;
+  session.zoomStart = 0;
+  session.zoomEnd = 1;
+  session.playhead = 0;
   return j;
 }
 
@@ -526,77 +552,194 @@ export async function apiSetDecodeSettings(opts) {
   }
 }
 
-// -------- embeddings --------
+// -------- LoRA data folder management --------
 
-export async function apiEmbeddingsList() {
+export async function apiLoraDataList(name, folder = null) {
   try {
-    const r = await fetch("/api/embeddings");
-    const j = await r.json();
-    session.embeddings = j.files ?? [];
-    return j;
-  } catch (e) {
-    console.warn("embeddings list failed:", e);
-  }
-}
-
-export async function apiEmbeddingCheckpoints(name) {
-  try {
-    const r = await fetch(
-      `/api/embeddings/${encodeURIComponent(name)}/checkpoints`,
-    );
+    const r = await fetch("/api/lora_data/list", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, folder }),
+    });
+    if (!r.ok) return null;
     return await r.json();
   } catch (e) {
-    console.warn("checkpoints list failed:", e);
-    return { checkpoints: [] };
+    console.warn("lora data list failed:", e);
+    return null;
   }
 }
 
-export async function apiApplyCheckpoint(name, file) {
-  const r = await fetch(
-    `/api/embeddings/${encodeURIComponent(name)}/apply_checkpoint`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ file }),
-    },
-  );
-  if (!r.ok) throw new Error("apply checkpoint failed: " + r.status);
-  return await r.json();
+export async function apiLoraDataUpload(name, folder, fileList) {
+  const fd = new FormData();
+  fd.append("name", name || "");
+  fd.append("folder", folder || "");
+  for (const f of fileList) fd.append("files", f);
+  try {
+    const r = await fetch("/api/lora_data/upload", { method: "POST", body: fd });
+    if (!r.ok) {
+      const txt = await r.text();
+      toasts.error("Upload failed: " + txt.slice(0, 200));
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    toasts.error("Upload failed: " + e.message);
+    return null;
+  }
 }
 
-export async function apiTrainEmbedding(
-  folder,
-  name,
-  tokens = 4,
-  steps = 500,
-  batch_size = 0,
-) {
+export async function apiLoraDataGetCaption(name, folder, file) {
   try {
-    const r = await fetch("/api/train_embedding", {
+    const q = new URLSearchParams({ name: name || "", folder: folder || "", file });
+    const r = await fetch(`/api/lora_data/caption?${q}`);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    console.warn("caption get failed:", e);
+    return null;
+  }
+}
+
+export async function apiLoraDataSetCaption(name, folder, file, text) {
+  try {
+    const r = await fetch("/api/lora_data/caption", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ folder, name, tokens, steps, batch_size }),
+      body: JSON.stringify({ name, folder, file, text }),
     });
     if (!r.ok) {
-      const err = await r.text();
-      throw new Error(err);
+      const txt = await r.text();
+      toasts.error("Caption save failed: " + txt.slice(0, 200));
+      return null;
     }
-    const j = await r.json();
-    toasts.success(`Training started: ${name}`);
-    return j;
+    return await r.json();
   } catch (e) {
-    toasts.error("Train failed: " + e.message);
+    toasts.error("Caption save failed: " + e.message);
+    return null;
   }
 }
 
-export async function apiTrainStatus() {
+export async function apiLoraDataClear(name, folder = null) {
   try {
-    const r = await fetch("/api/train_embedding/status");
+    const r = await fetch("/api/lora_data/clear", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, folder }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      toasts.error("Clear failed: " + txt.slice(0, 200));
+      return null;
+    }
     return await r.json();
   } catch (e) {
-    return { status: "error", error: e.message };
+    toasts.error("Clear failed: " + e.message);
+    return null;
   }
 }
+
+export async function apiLoraDataClearCaptions(name, folder = null) {
+  return _postJson("/api/lora_data/clear_captions", { name, folder });
+}
+
+export async function apiClearEncoded(name) {
+  if (!name) return null;
+  return _postJson("/api/pre_encode/clear", { name });
+}
+
+export async function apiCancelPreEncode() {
+  return _postJson("/api/pre_encode/cancel", {});
+}
+
+export async function apiCancelLoraTrain() {
+  return _postJson("/api/train_lora/cancel", {});
+}
+
+export async function apiGetTrainSettings(name) {
+  if (!name) return {};
+  return (await _postJson("/api/lora_data/train_settings/get", { name })) || {};
+}
+export async function apiSetTrainSettings(name, settings) {
+  if (!name) return null;
+  return _postJson("/api/lora_data/train_settings/set", { name, settings });
+}
+
+// ── auto-captioner ──────────────────────────────────────────────────────────
+async function _postJson(url, body) {
+  try {
+    const r = await fetch(url, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { const t = await r.text(); toasts.error(t.slice(0, 200)); return null; }
+    return await r.json();
+  } catch (e) { toasts.error(String(e)); return null; }
+}
+
+export async function apiAutocaptionEstimate(name, folder, opts = {}) {
+  return _postJson("/api/lora_data/autocaption/estimate", {
+    name, folder, only_uncaptioned: opts.onlyUncaptioned ?? true,
+    model: opts.model || "pro",
+  });
+}
+export async function apiAutocaptionStart(name, folder, opts) {
+  return _postJson("/api/lora_data/autocaption/start", {
+    name, folder, only_uncaptioned: opts.onlyUncaptioned ?? true,
+    examples: opts.examples, parallel: opts.parallel, model: opts.model || "pro",
+  });
+}
+export async function apiAutocaptionStatus() {
+  try {
+    const r = await fetch("/api/lora_data/autocaption/status");
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+export async function apiAutocaptionCancel() {
+  return _postJson("/api/lora_data/autocaption/cancel", {});
+}
+export async function apiCaptionerExamplesGet(name, folder) {
+  return _postJson("/api/lora_data/captioner_examples/get", { name, folder });
+}
+export async function apiCaptionerExamplesSet(name, folder, examples, model, parallel) {
+  return _postJson("/api/lora_data/captioner_examples/set", { name, folder, examples, model, parallel });
+}
+
+
+export async function apiLoraDataRename(oldName, newName) {
+  try {
+    const r = await fetch("/api/lora_data/rename", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ old_name: oldName, new_name: newName }),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      toasts.error("Rename failed: " + txt.slice(0, 200));
+      return null;
+    }
+    return await r.json();
+  } catch (e) {
+    toasts.error("Rename failed: " + e.message);
+    return null;
+  }
+}
+
+export async function apiLoraDataDelete(name, folder, file) {
+  try {
+    const r = await fetch("/api/lora_data/delete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, folder, file }),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    console.warn("lora data delete failed:", e);
+    return null;
+  }
+}
+
 
 export async function apiTrainLora(opts) {
   try {

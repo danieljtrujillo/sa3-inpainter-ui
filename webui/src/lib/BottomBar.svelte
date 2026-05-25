@@ -1,17 +1,9 @@
 <script>
-import { session, apiGetSettings } from "./session.svelte.js";
+import { session } from "./session.svelte.js";
 import { fmtTime } from "./util.js";
-import SettingsModal from "./SettingsModal.svelte";
-import { onMount } from "svelte";
 
 let currentTime = $derived(session.playhead * session.trackSeconds);
 let totalTime = $derived(session.trackSeconds);
-let settingsOpen = $state(false);
-
-onMount(async () => {
-  const s = await apiGetSettings();
-  if (s?.first_run) settingsOpen = true;
-});
 
 function togglePlay() {
   session.playing = !session.playing;
@@ -55,15 +47,6 @@ function togglePlay() {
 
   <!-- right cluster -->
   <div class="right-cluster">
-    <button class="mode-toggle" class:active={session.advancedMode}
-      onclick={() => session.advancedMode = !session.advancedMode}
-      title={session.advancedMode ? "Switch to simple mode" : "Switch to advanced mode"}>
-      <i class="bi {session.advancedMode ? 'bi-toggles' : 'bi-sliders'}"></i>
-      {session.advancedMode ? "Advanced" : "Simple"}
-    </button>
-    <button class="mode-toggle" onclick={() => settingsOpen = true} title="Settings">
-      <i class="bi bi-gear"></i>
-    </button>
     <div class="status">
       <span class="status-dot" class:ok={session.modelLoaded}></span>
       <span class="status-label">{session.modelLoaded ? "Model ready" : "Loading…"}</span>
@@ -85,14 +68,12 @@ function togglePlay() {
   </div>
 </footer>
 
-<SettingsModal bind:visible={settingsOpen} />
-
 <style>
 .bottombar {
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  padding: 0 var(--gap-4);
+  padding: 0 32px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-dark);
   font-size: 11px;
@@ -107,16 +88,18 @@ function togglePlay() {
 }
 .transport {
   display: flex;
-  gap: var(--gap-1);
+  gap: var(--gap-2);
   justify-self: center;
 }
+.transport .icon-btn { width: 30px; height: 30px; font-size: 16px; }
+.transport .icon-btn.play { font-size: 20px; }
 .right-cluster {
   display: flex;
   align-items: center;
   gap: var(--gap-4);
   justify-self: end;
 }
-.icon-btn.play { color: var(--text-primary); font-size: 16px; }
+.icon-btn.play { color: var(--text-primary); }
 .icon-btn.active { color: var(--accent-blue); }
 .icon-btn[disabled] { color: var(--text-muted); cursor: default; }
 .icon-btn[disabled]:hover { background: transparent; color: var(--text-muted); }
@@ -186,7 +169,9 @@ function togglePlay() {
   height: 2px;
   background: var(--border-color);
   margin-top: 2px;
-  width: 60px;
+  /* span the full width of the stat row so it always fits the text above */
+  width: auto;
+  min-width: 90px;
 }
 .bar-fill { height: 100%; background: var(--accent-blue); }
 </style>

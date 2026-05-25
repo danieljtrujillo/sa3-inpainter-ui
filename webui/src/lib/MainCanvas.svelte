@@ -1,6 +1,8 @@
 <script>
 import { session } from "./session.svelte.js";
 import WaveformCanvas from "./WaveformCanvas.svelte";
+import WaveformOverlay from "./WaveformOverlay.svelte";
+import SpecCanvas from "./SpecCanvas.svelte";
 
 let canvasBody = $state(null);
 let isShiftDown = $state(false);
@@ -176,7 +178,7 @@ function onPointerUp(e) {
     const rect = canvasBody.getBoundingClientRect();
     const norm = (e.clientX - rect.left) / rect.width;
     const span = session.zoomEnd - session.zoomStart;
-    session.playhead = Math.max(0, Math.min(1, session.zoomStart + norm * span));
+    session.snapPlayhead(session.zoomStart + norm * span);
   }
   paintActive = false;
   paintAnchor = -1;
@@ -214,16 +216,12 @@ $effect(() => {
   >
     <div class="pane spec-pane" class:with-audio={session.hasAudio}>
       {#if session.hasAudio}
-        <img src={`/api/spec.png?v=${session.version}`} alt="" draggable="false" style={imgTransform} />
-        <!-- noise preview overlay — only visible while user is actively dragging the A2A slider -->
-        {#if session.scrubbingNoise && !session.hasMask && session.noise > 0}
-          <img src="/api/noise_spec.png" alt="" draggable="false"
-               class="noise-overlay" style="{imgTransform}; opacity: {session.noise}" />
-        {/if}
+        <SpecCanvas />
       {/if}
     </div>
     <div class="pane wave-pane">
       <WaveformCanvas />
+      <WaveformOverlay />
     </div>
     {#if !session.hasAudio && !session.generating}
       <div class="empty-hint">load a sample or type a prompt to start</div>
@@ -275,7 +273,7 @@ $effect(() => {
   touch-action: none;
   min-height: 0; min-width: 0;
   display: grid;
-  grid-template-rows: 65% 35%;
+  grid-template-rows: 78% 22%;
   height: 100%;
 }
 .main-canvas.erasing { cursor: not-allowed; }
@@ -286,7 +284,7 @@ $effect(() => {
   min-height: 0;
 }
 .spec-pane.with-audio { border-bottom: 1px solid var(--border-color); }
-.wave-pane { padding: 6px 0; }   /* breathing room top + bottom of waveform */
+.wave-pane { padding: 12px 0; }   /* breathing room top + bottom of waveform */
 
 img {
   position: absolute;
@@ -333,10 +331,13 @@ img.noise-overlay { mix-blend-mode: screen; }
 }
 .playhead {
   position: absolute;
-  top: 0; bottom: 0;
+  /* extend up through the 10px spacer so the line meets the time-axis triangle */
+  top: -10px; bottom: 0;
   width: 1px;
   background: #ffffff;
-  box-shadow: 2px 0 0 rgba(0,0,0,0.85), -2px 0 0 rgba(0,0,0,0.85);
+  /* offsets at ±1 so the black bars sit immediately adjacent to the white line
+     (no transparent sliver where the colored bars below would bleed through) */
+  box-shadow: 1px 0 0 rgba(0,0,0,0.85), -1px 0 0 rgba(0,0,0,0.85);
   pointer-events: none;
 }
 .playhead-time {

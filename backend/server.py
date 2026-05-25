@@ -22,7 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.signal import stft
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -63,13 +63,38 @@ _SETTINGS_FILE = Path(os.environ.get(
     str(Path.home() / ".config" / "sa3-inpainter" / "settings.json"),
 ))
 
+_DEFAULT_CAPTIONER_EXAMPLES = "\n".join([
+    "soundscape with piano arps, indie pop with male vocals, offbeat bassline with house drums and ambient electric guitar",
+    "bright synth leads, pitched vocal chops, disco house, euphoric and danceable",
+    "ethereal electric piano intro, fast 808 melody, experimental drill, plucked guitar outro",
+])
+
+def _autodetect_sa3_root() -> str:
+    """Look for a stable-audio-3 checkout in a few common locations."""
+    candidates = [
+        Path.home() / "Projects" / "stable-audio-3",
+        Path.home() / "stable-audio-3",
+        Path.home() / "code"     / "stable-audio-3",
+        Path.home() / "repos"    / "stable-audio-3",
+        Path.home() / "src"      / "stable-audio-3",
+        Path.home() / "Documents" / "stable-audio-3",
+    ]
+    for p in candidates:
+        if (p / "stable_audio_3").is_dir() or (p / "pyproject.toml").exists() or (p / "setup.py").exists():
+            return str(p)
+    return ""
+
 _SETTINGS_DEFAULTS = {
     "models_dir": str(Path.home() / "sa3-inpainter" / "models"),
     "lora_dir": str(Path.home() / "sa3-inpainter" / "loras"),
     "lora_train_dir": str(Path.home() / "sa3-inpainter" / "lora_training"),
-    "embeddings_dir": str(Path.home() / "sa3-inpainter" / "embeddings"),
-    "sa3_root": "",
+    "sa3_root": _autodetect_sa3_root(),
     "hf_token": "",
+    "openrouter_api_key": "",
+    "captioner_model": "pro",
+    "captioner_parallel": 32,
+    "captioner_examples": _DEFAULT_CAPTIONER_EXAMPLES,
+    "lora_adapter": "dora-rows",
 }
 
 def _load_settings():
@@ -90,18 +115,16 @@ def _save_settings(s):
 _settings = _load_settings()
 
 def _apply_settings():
-    global MODELS_DIR, LOCAL_MEDIUM, LORA_DIR, LORA_TRAIN_DIR, EMBED_DIR
+    global MODELS_DIR, LOCAL_MEDIUM, LORA_DIR, LORA_TRAIN_DIR
     MODELS_DIR = Path(_settings["models_dir"])
     LOCAL_MEDIUM = str(MODELS_DIR / "stable-audio-3-medium")
     LORA_DIR = Path(_settings["lora_dir"])
     LORA_TRAIN_DIR = Path(_settings["lora_train_dir"])
-    EMBED_DIR = Path(_settings["embeddings_dir"])
 
 MODELS_DIR = Path(os.environ.get("SA3_MODELS_DIR", _settings["models_dir"]))
 LOCAL_MEDIUM = os.environ.get("SA3_MODEL_DIR", str(MODELS_DIR / "stable-audio-3-medium"))
 LORA_DIR = Path(os.environ.get("SA3_LORA_DIR", _settings["lora_dir"]))
 LORA_TRAIN_DIR = Path(os.environ.get("SA3_LORA_TRAIN_DIR", _settings["lora_train_dir"]))
-EMBED_DIR = Path(os.environ.get("SA3_EMBED_DIR", _settings["embeddings_dir"]))
 DATA_DIR = Path("/tmp/sa3-inpainter"); DATA_DIR.mkdir(exist_ok=True)
 SR = 44100
 DOWNSAMPLE = 4096
@@ -335,7 +358,7 @@ def compute_envelope(audio_np):
 def render_spec_png(audio_np, out_path):
     mono = audio_np.mean(axis=0) if audio_np.ndim == 2 else audio_np
     n_fft = 8192
-    hop = DOWNSAMPLE
+    hop = 1024   # 4x finer time resolution than DOWNSAMPLE — better at deep zoom
     f, t, Z = stft(mono, fs=SR, nperseg=n_fft, noverlap=n_fft - hop, boundary=None, padded=False)
     P = np.abs(Z) ** 2
     P_db = 10.0 * np.log10(P + 1e-12)
@@ -350,7 +373,7 @@ def render_spec_png(audio_np, out_path):
     spec_log = np.zeros((out_h, P_db.shape[1]), dtype=np.float32)
     for j in range(P_db.shape[1]):
         spec_log[:, j] = np.interp(log_f, f, P_db[:, j])
-    fig = plt.figure(figsize=(20, 6), dpi=100)
+    fig = plt.figure(figsize=(40, 6), dpi=100)   # 4000x600 — room for the finer hop
     fig.patch.set_facecolor("black")
     ax = fig.add_axes([0,0,1,1]); ax.set_axis_off()
     ax.imshow(spec_log[::-1], aspect="auto", origin="upper", cmap="magma", interpolation="nearest", extent=(0,1,0,1))
@@ -365,7 +388,9 @@ def render_overview_png(audio_np, out_path, W=2000, H=80):
     for i in range(W):
         s = i * bin_sz
         peaks[i] = np.max(np.abs(mono[s:s+bin_sz])) if s < len(mono) else 0
-    peaks /= peaks.max() + 1e-9
+    # peaks stay in true amplitude [0, 1] — do not normalize, or quiet songs
+    # render as sausage and loud songs lose dynamics
+    peaks = np.clip(peaks, 0.0, 1.0)
     fig = plt.figure(figsize=(W/100, H/100), dpi=100)
     fig.patch.set_facecolor("#000000")
     ax = fig.add_axes([0, 0, 1, 1]); ax.set_axis_off()
@@ -416,76 +441,6 @@ def _unload_loras(loras: list[dict]) -> None:
         return
     sa.set_lora_strength(0.0)
     print(f"[lora] deactivated {_loaded_lora_name}")
-
-
-# -------- embedding injection --------
-
-_embed_cache = {}  # name → (trigger, tensor)
-
-
-def _load_embedding(name):
-    """Load a textual inversion embedding from EMBED_DIR. Returns (trigger, tensor) or None."""
-    if name in _embed_cache:
-        return _embed_cache[name]
-    path = EMBED_DIR / f"{name}.safetensors"
-    if not path.exists():
-        return None
-    data = load_file(str(path))
-    emb = data.get("embedding", data.get("emb", next(iter(data.values()))))
-    emb = emb.to(DEVICE)
-    if _use_fp16 and DEVICE == "cuda":
-        emb = emb.half()
-    trigger = f"<{name}>"
-    _embed_cache[name] = (trigger, emb)
-    print(f"[embed] loaded {name}: {emb.shape}")
-    return trigger, emb
-
-
-def _find_embeddings_in_prompt(prompt):
-    """Find <name> or <name:strength> triggers in prompt, return list of (name, tensor, strength)."""
-    import re
-    matches = re.findall(r"<([^>]+)>", prompt)
-    found = []
-    for m in matches:
-        parts = m.split(":")
-        name = parts[0]
-        strength = float(parts[1]) if len(parts) > 1 else 1.0
-        strength = max(0.01, min(2.0, strength))
-        result = _load_embedding(name)
-        if result:
-            found.append((name, result[1], strength))
-    return found
-
-
-def _strip_embed_triggers(prompt):
-    """Remove <name> and <name:strength> triggers from prompt text."""
-    import re
-    return re.sub(r"<[^>]+>", "", prompt).strip()
-
-
-def _inject_embeddings(prompt, conditioning_tensors):
-    """Inject learned embeddings into conditioning, replacing padding at the end.
-    Modifies conditioning_tensors['prompt'][0] in-place."""
-    embeds = _find_embeddings_in_prompt(prompt)
-    if not embeds:
-        return
-    cond = conditioning_tensors.get("prompt")
-    if cond is None:
-        return
-    embed_tensor, mask = cond
-    real_len = mask[0].sum().item() if mask is not None else embed_tensor.shape[1]
-    insert_pos = int(real_len)
-    for name, emb, strength in embeds:
-        if emb.ndim == 1:
-            emb = emb.unsqueeze(0)
-        n_tok = emb.shape[0]
-        if insert_pos + n_tok > embed_tensor.shape[1]:
-            continue
-        embed_tensor[0, insert_pos:insert_pos + n_tok] = emb[:n_tok] * strength
-        if mask is not None:
-            mask[0, insert_pos:insert_pos + n_tok] = True
-        print(f"[embed] injected {name} ({n_tok} tokens, strength={strength:.2f}) at pos {insert_pos}")
-        insert_pos += n_tok
 
 
 # -------- endpoints --------
@@ -679,23 +634,6 @@ async def generate(body: GenBody):
     else:
         kwargs["duration"] = duration
         kwargs["sample_size"] = int(duration * SR)
-
-    # pre-encode conditioning if embeddings are used
-    has_embeds = bool(_find_embeddings_in_prompt(body.prompt))
-    if has_embeds:
-        clean_prompt = _strip_embed_triggers(body.prompt)
-        cond_dicts, neg_cond_dicts = sa._build_conditioning_dicts(
-            clean_prompt, neg_prompt,
-            kwargs.get("duration", duration), 1
-        )
-        cond_tensors = sa.model.conditioner(cond_dicts, DEVICE)
-        _inject_embeddings(body.prompt, cond_tensors)
-        neg_cond_tensors = sa.model.conditioner(neg_cond_dicts, DEVICE) if neg_cond_dicts else {}
-        kwargs.pop("prompt", None)
-        kwargs.pop("negative_prompt", None)
-        kwargs["conditioning"] = cond_dicts
-        kwargs["conditioning_tensors"] = cond_tensors
-        kwargs["negative_conditioning_tensors"] = neg_cond_tensors
 
     loras_list = [l.model_dump() for l in body.loras]
 
@@ -903,33 +841,42 @@ async def get_state():
             "bpm": state.get("bpm")}
 
 
+def _mask_secrets(safe: dict) -> dict:
+    if safe.get("hf_token"):
+        safe["hf_token"] = "hf_****" + safe["hf_token"][-4:]
+    if safe.get("openrouter_api_key"):
+        safe["openrouter_api_key"] = "sk-or-****" + safe["openrouter_api_key"][-4:]
+    return safe
+
 @app.get("/api/settings")
 async def get_settings():
     safe = {**_settings, "first_run": not _SETTINGS_FILE.exists()}
-    if safe.get("hf_token"):
-        safe["hf_token"] = "hf_****" + safe["hf_token"][-4:]
-    return safe
+    return _mask_secrets(safe)
 
 class SettingsBody(BaseModel):
     models_dir: str | None = None
     lora_dir: str | None = None
     lora_train_dir: str | None = None
-    embeddings_dir: str | None = None
     sa3_root: str | None = None
     hf_token: str | None = None
+    openrouter_api_key: str | None = None
+    captioner_model: str | None = None
+    captioner_parallel: int | None = None
+    captioner_examples: str | None = None
+    lora_adapter: str | None = None
 
 @app.post("/api/settings")
 async def update_settings(body: SettingsBody):
     changed = {k: v for k, v in body.model_dump().items() if v is not None}
+    # Don't overwrite real secrets with their masked echo
     if changed.get("hf_token", "").startswith("hf_****"):
         del changed["hf_token"]
+    if changed.get("openrouter_api_key", "").startswith("sk-or-****"):
+        del changed["openrouter_api_key"]
     _settings.update(changed)
     _save_settings(_settings)
     _apply_settings()
-    safe = {**_settings}
-    if safe.get("hf_token"):
-        safe["hf_token"] = "hf_****" + safe["hf_token"][-4:]
-    return safe
+    return _mask_secrets({**_settings})
 
 
 import psutil
@@ -1086,68 +1033,6 @@ async def set_memory_tokens(body: MemtokBody):
     return {"strength": _memory_token_strength, "status": "ok"}
 
 
-# -------- embeddings (textual inversion) --------
-
-@app.get("/api/embeddings")
-async def list_embeddings():
-    EMBED_DIR.mkdir(parents=True, exist_ok=True)
-    files = []
-    for p in sorted(EMBED_DIR.iterdir()):
-        if p.suffix == ".safetensors":
-            ckpt_dir = EMBED_DIR / p.stem
-            has_ckpts = ckpt_dir.is_dir() and any(ckpt_dir.glob("*.safetensors"))
-            files.append({"name": p.stem, "file": p.name, "has_checkpoints": has_ckpts})
-    return {"dir": str(EMBED_DIR), "files": files}
-
-
-@app.get("/api/embeddings/{name}/checkpoints")
-async def list_checkpoints(name: str):
-    ckpt_dir = EMBED_DIR / name
-    if not ckpt_dir.is_dir():
-        return {"checkpoints": []}
-    items = []
-    for p in sorted(ckpt_dir.iterdir()):
-        if p.suffix != ".safetensors":
-            continue
-        parts = p.stem.split("_")
-        try:
-            step = int(parts[1])
-            loss = float(parts[3])
-            items.append({"file": p.name, "step": step, "loss": loss})
-        except (IndexError, ValueError):
-            continue
-    return {"checkpoints": items}
-
-
-class ApplyCheckpointBody(BaseModel):
-    file: str
-
-
-@app.post("/api/embeddings/{name}/apply_checkpoint")
-async def apply_checkpoint(name: str, body: ApplyCheckpointBody):
-    ckpt_path = EMBED_DIR / name / body.file
-    if not ckpt_path.exists():
-        raise HTTPException(404, f"checkpoint not found: {body.file}")
-    active_path = EMBED_DIR / f"{name}.safetensors"
-    shutil.copy2(str(ckpt_path), str(active_path))
-    _embed_cache.pop(name, None)
-    print(f"[embed] applied checkpoint {body.file} for {name}")
-    return {"status": "applied", "name": name, "checkpoint": body.file}
-
-
-class TrainEmbedBody(BaseModel):
-    folder: str
-    name: str
-    tokens: int = 4
-    steps: int = 500
-    lr: float = 0.005
-    batch_size: int = 0  # 0 = auto
-
-
-_train_proc = None
-_train_last_result = None
-
-
 @app.get("/api/browse_folder")
 async def browse_folder(start: str = "~"):
     """Open a native folder picker dialog and return the selected path."""
@@ -1174,95 +1059,559 @@ async def browse_folder(start: str = "~"):
             raise HTTPException(status_code=501, detail="No dialog tool found (zenity or kdialog)")
 
 
-@app.post("/api/train_embedding")
-async def train_embedding(body: TrainEmbedBody):
-    global _train_proc
-    if _train_proc and _train_proc.returncode is None:
-        raise HTTPException(409, "training already in progress")
+# -------- LoRA data folder management --------
 
-    folder = Path(body.folder).expanduser().resolve()
-    if not folder.is_dir():
-        raise HTTPException(400, f"folder not found: {folder}")
+_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aiff", ".aif"}
 
-    output = str(EMBED_DIR / f"{body.name}.safetensors")
-    EMBED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # resolve model path
-    model_path = LOCAL_MEDIUM
-    if _current_model and _current_model != "medium":
-        resolved = _resolve_local_path(_current_model)
-        if resolved:
-            model_path = resolved
+def _lora_data_folder(name: str, folder: str | None) -> Path:
+    """Resolve the active dataset folder for a LoRA. Override wins; otherwise
+    the default convention is LORA_TRAIN_DIR/<name>/data."""
+    if folder:
+        return Path(folder).expanduser().resolve()
+    if not name:
+        raise HTTPException(400, "lora name required when no folder override is set")
+    return (LORA_TRAIN_DIR / name / "data").resolve()
 
-    script = str(Path(__file__).resolve().parent / "train_embedding.py")
+
+def _scan_lora_folder(d: Path) -> dict:
+    files = []
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in _AUDIO_EXTS:
+                txt = d / (p.stem + ".txt")
+                cap_text = ""
+                if txt.exists():
+                    try:
+                        # cap to a sane length so list responses stay small
+                        cap_text = txt.read_text(encoding="utf-8")[:500]
+                    except Exception:
+                        cap_text = ""
+                files.append({
+                    "name": p.name,
+                    "stem": p.stem,
+                    "ext": p.suffix.lower().lstrip("."),
+                    "captioned": txt.exists(),
+                    "caption": cap_text,
+                })
+    return {
+        "folder": str(d),
+        "exists": d.is_dir(),
+        "files": files,
+        "total": len(files),
+        "captioned": sum(1 for f in files if f["captioned"]),
+    }
+
+
+class LoraDataQuery(BaseModel):
+    name: str = ""
+    folder: str | None = None
+
+
+@app.post("/api/lora_data/list")
+async def lora_data_list(body: LoraDataQuery):
+    if not body.name and not body.folder:
+        return {"folder": "", "exists": False, "files": [], "total": 0, "captioned": 0}
+    d = _lora_data_folder(body.name, body.folder)
+    return _scan_lora_folder(d)
+
+
+@app.post("/api/lora_data/upload")
+async def lora_data_upload(
+    name: str = Form(""),
+    folder: str = Form(""),
+    files: list[UploadFile] = File(...),
+):
+    d = _lora_data_folder(name, folder or None)
+    d.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for f in files:
+        # accept audio and paired .txt files
+        ext = Path(f.filename).suffix.lower()
+        if ext not in _AUDIO_EXTS and ext != ".txt":
+            continue
+        target = d / f.filename
+        target.write_bytes(await f.read())
+        saved.append(f.filename)
+    return {"saved": saved, **_scan_lora_folder(d)}
+
+
+def _render_audio_thumb(audio_path: Path, out_path: Path, size: int = 96):
+    """Render a small square spectrogram thumbnail of an audio file.
+    Uses PIL + numpy directly (no matplotlib) — matplotlib's figure/axes
+    overhead alone is ~50-100ms per call, which dwarfs the actual STFT for
+    tiny outputs. With PIL the whole thing is ~3-10ms."""
+    import soundfile as sf
+    from scipy.signal import stft as _stft
+    from PIL import Image
+    from matplotlib import cm  # only used for the colormap LUT — no figures
+    audio, sr = sf.read(str(audio_path))
+    if audio.ndim == 2: audio = audio.mean(axis=1)
+    if len(audio) < 64: return False
+    n_fft = 512
+    hop = max(1, len(audio) // (size * 2))
+    f, _t, Z = _stft(audio, fs=sr, nperseg=n_fft, noverlap=n_fft - hop, boundary=None, padded=False)
+    P = np.abs(Z) ** 2
+    Pdb = 10.0 * np.log10(P + 1e-12)
+    Pdb = np.clip(Pdb, -55, Pdb.max())
+    if Pdb.max() < Pdb.min() + 1e-6:
+        Pdb = np.zeros_like(Pdb)
+    else:
+        Pdb -= Pdb.min(); Pdb /= Pdb.max(); Pdb = Pdb ** 0.55
+    # log-frequency squish into `size` rows (top = high freq)
+    log_f = np.geomspace(30, min(16000, sr / 2), size)
+    spec_log = np.empty((size, Pdb.shape[1]), dtype=np.float32)
+    for j in range(Pdb.shape[1]):
+        spec_log[:, j] = np.interp(log_f, f, Pdb[:, j])
+    # resample columns to `size` so output is square
+    if spec_log.shape[1] != size:
+        idx = np.linspace(0, spec_log.shape[1] - 1, size)
+        spec_log = spec_log[:, idx.astype(np.int32)]
+    # flip so y=0 (top) is high frequency
+    spec_log = spec_log[::-1]
+    # apply magma colormap via PIL
+    magma = cm.get_cmap("magma")
+    rgba = (magma(np.clip(spec_log, 0, 1)) * 255).astype(np.uint8)
+    img = Image.fromarray(rgba[:, :, :3], mode="RGB")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, format="PNG", optimize=False, compress_level=1)
+    return True
+
+
+@app.get("/api/lora_data/thumb")
+async def lora_data_thumb(name: str = "", folder: str = "", file: str = ""):
+    if not file:
+        raise HTTPException(400, "file required")
+    if not name and not folder:
+        raise HTTPException(400, "name or folder required")
+    d = _lora_data_folder(name, folder or None)
+    src = d / file
+    if not src.is_file() or src.suffix.lower() not in _AUDIO_EXTS:
+        raise HTTPException(404, "audio file not found")
+    thumb_dir = d / "_thumbs"
+    thumb_path = thumb_dir / (Path(file).stem + ".png")
+    # Serve cached thumb if it's newer than the audio file
+    if thumb_path.exists() and thumb_path.stat().st_mtime >= src.stat().st_mtime:
+        return FileResponse(thumb_path, media_type="image/png")
+    try:
+        ok = _render_audio_thumb(src, thumb_path)
+        if not ok: raise HTTPException(500, "thumb render failed")
+    except HTTPException: raise
+    except Exception as e:
+        raise HTTPException(500, f"thumb render error: {e}")
+    return FileResponse(thumb_path, media_type="image/png")
+
+
+@app.get("/api/lora_data/caption")
+async def lora_data_get_caption(name: str = "", folder: str = "", file: str = ""):
+    if not file: raise HTTPException(400, "file required")
+    if not name and not folder: raise HTTPException(400, "name or folder required")
+    d = _lora_data_folder(name, folder or None)
+    txt = d / (Path(file).stem + ".txt")
+    if not txt.exists(): return {"text": "", "exists": False}
+    try:
+        return {"text": txt.read_text(encoding="utf-8"), "exists": True}
+    except Exception as e:
+        raise HTTPException(500, f"read failed: {e}")
+
+
+class CaptionBody(BaseModel):
+    name: str = ""
+    folder: str | None = None
+    file: str
+    text: str
+
+
+@app.post("/api/lora_data/caption")
+async def lora_data_set_caption(body: CaptionBody):
+    if not body.file: raise HTTPException(400, "file required")
+    if not body.name and not body.folder: raise HTTPException(400, "name or folder required")
+    d = _lora_data_folder(body.name, body.folder)
+    txt = d / (Path(body.file).stem + ".txt")
+    cleaned = body.text.strip()
+    if cleaned == "":
+        # Empty caption → delete the .txt sidecar
+        if txt.exists():
+            try: txt.unlink()
+            except Exception as e: raise HTTPException(500, f"delete failed: {e}")
+        return _scan_lora_folder(d)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        txt.write_text(cleaned, encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(500, f"write failed: {e}")
+    return _scan_lora_folder(d)
+
+
+class LoraDataClearBody(BaseModel):
+    name: str = ""
+    folder: str | None = None
+
+
+@app.post("/api/lora_data/clear")
+async def lora_data_clear(body: LoraDataClearBody):
+    if not body.name and not body.folder:
+        return _scan_lora_folder(_lora_data_folder(body.name, body.folder))
+    d = _lora_data_folder(body.name, body.folder)
+    if d.is_dir():
+        for p in d.iterdir():
+            if p.is_file():
+                try: p.unlink()
+                except Exception as e: print(f"[lora_data] failed to remove {p}: {e}")
+    return _scan_lora_folder(d)
+
+
+class TrainSettingsGetBody(BaseModel):
+    name: str = ""
+
+class TrainSettingsSetBody(BaseModel):
+    name: str = ""
+    settings: dict = {}
+
+
+def _train_settings_path(name: str) -> Path:
+    return LORA_TRAIN_DIR / name / "train_settings.json"
+
+
+@app.post("/api/lora_data/train_settings/get")
+async def train_settings_get(body: TrainSettingsGetBody):
+    if not body.name: return {}
+    p = _train_settings_path(body.name)
+    if not p.exists(): return {}
+    try: return json.loads(p.read_text())
+    except Exception: return {}
+
+
+@app.post("/api/lora_data/train_settings/set")
+async def train_settings_set(body: TrainSettingsSetBody):
+    if not body.name: raise HTTPException(400, "name required")
+    p = _train_settings_path(body.name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(body.settings or {}, indent=2))
+    return {"ok": True}
+
+
+@app.post("/api/lora_data/clear_captions")
+async def lora_data_clear_captions(body: LoraDataClearBody):
+    """Delete every .txt sidecar that pairs with an audio file in the folder."""
+    if not body.name and not body.folder:
+        raise HTTPException(400, "name or folder required")
+    d = _lora_data_folder(body.name, body.folder)
+    if d.is_dir():
+        audio_stems = {p.stem for p in d.iterdir()
+                       if p.is_file() and p.suffix.lower() in _AUDIO_EXTS}
+        for p in d.iterdir():
+            if p.is_file() and p.suffix.lower() == ".txt" and p.stem in audio_stems:
+                try: p.unlink()
+                except Exception as e: print(f"[lora_data] failed to remove {p}: {e}")
+    return _scan_lora_folder(d)
+
+
+class ProfileBody(BaseModel):
+    name: str = ""              # lora name — used to locate pre-encoded data
+    adapter_type: str = "dora-rows"
+    rank: int = 16
+    batch_size: int = 1
+    n_steps: int = 5
+
+
+@app.post("/api/train_lora/profile")
+async def train_lora_profile(body: ProfileBody):
+    """Run N actual training steps to measure ms/step + peak RAM.
+    Requires pre-encoded latents at LORA_TRAIN_DIR/<name>/."""
+    import tempfile, shutil
+    if not body.name:
+        body.name = "_scratch"
+
+    encoded_dir = LORA_TRAIN_DIR / body.name / "_encoded"
+    has_real_latents = encoded_dir.is_dir() and bool(list(encoded_dir.glob("*.npy")))
+
+    dummy_dir = None
+    if not has_real_latents:
+        # No pre-encoded data: synthesize a tiny dummy dataset matching the latent
+        # shape produced by pre_encode_mlx.py (256-dim × T_lat frames). 30s clips
+        # yield T_lat≈324; we use 4 files so batch sampling has variety.
+        dummy_dir = Path(tempfile.mkdtemp(prefix="sa3_profile_dummy_"))
+        T_lat = 324
+        rng = np.random.default_rng(0)
+        for i in range(4):
+            lat = rng.standard_normal((256, T_lat)).astype(np.float16)
+            np.save(str(dummy_dir / f"{i:010d}.npy"), lat)
+            meta = {"path": "dummy", "relpath": f"dummy_{i}.wav",
+                    "seconds_total": 30.0, "padding_mask": [1] * T_lat}
+            (dummy_dir / f"{i:010d}.json").write_text(json.dumps(meta))
+        encoded_dir = dummy_dir
+
+    out_dir = Path(tempfile.mkdtemp(prefix="sa3_profile_"))
+    script = str(Path(__file__).resolve().parent.parent / "mlx_sa3" / "train_lora_mlx.py")
     cmd = [
         sys.executable, script,
-        "--model-path", model_path,
-        "--audio-folder", str(folder),
-        "--output", output,
-        "--tokens", str(body.tokens),
-        "--steps", str(body.steps),
-        "--lr", str(body.lr),
-        "--device", DEVICE,
-        "--checkpoint-dir", str(EMBED_DIR / body.name),
-        "--checkpoint-every", "50",
-        "--batch-size", str(body.batch_size),
+        "--encoded-dir", str(encoded_dir),
+        "--output-dir", str(out_dir),
+        "--rank", str(body.rank),
+        "--adapter-type", body.adapter_type,
+        "--steps", str(max(2, body.n_steps)),
+        "--batch-size", str(max(1, body.batch_size or 1)),
+        "--checkpoint-every", "9999999",   # don't checkpoint during profile
     ]
-    if _use_fp16:
-        cmd.append("--fp16")
 
-    _train_proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    env = os.environ.copy()
+    env["SA3_ROOT"] = _settings["sa3_root"]
+    env["SA3_MODELS_DIR"] = str(MODELS_DIR)
+    env["SA3_LORA_DIR"] = str(LORA_DIR)
+    if _settings.get("hf_token"):
+        env["HF_TOKEN"] = _settings["hf_token"]
+
+    # Track peak memory in the parent process group via psutil
+    import psutil as _ps
+    peak_bytes = 0
+    cancelled = False
+    t0 = time.time()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
-    return {"status": "started", "name": body.name, "output": output}
 
-
-@app.get("/api/train_embedding/status")
-async def train_status():
-    global _train_proc, _train_last_result
-    if _train_proc is None:
-        if _train_last_result is not None:
-            result = _train_last_result
-            _train_last_result = None
-            return result
-        return {"status": "idle"}
-    if _train_proc.returncode is not None:
-        stdout = (await _train_proc.stdout.read()).decode()
-        stderr = (await _train_proc.stderr.read()).decode()
-        lines = [l for l in stdout.strip().split("\n") if l.strip()]
-        last = {}
-        for l in reversed(lines):
+    async def _watch_mem():
+        nonlocal peak_bytes
+        try:
+            p = _ps.Process(proc.pid)
+        except _ps.NoSuchProcess:
+            return
+        while proc.returncode is None:
             try:
-                last = json.loads(l)
+                rss = p.memory_info().rss
+                for c in p.children(recursive=True):
+                    try: rss += c.memory_info().rss
+                    except _ps.NoSuchProcess: pass
+                if rss > peak_bytes: peak_bytes = rss
+            except _ps.NoSuchProcess:
                 break
-            except Exception:
-                continue
-        ok = _train_proc.returncode == 0
-        _train_proc = None
-        _embed_cache.clear()
-        if not ok:
-            print(f"[train] FAILED (rc={1 if not ok else 0})")
-            if stderr:
-                print(f"[train] stderr: {stderr[:2000]}")
-            if stdout:
-                print(f"[train] stdout: {stdout[:2000]}")
-        _train_last_result = {"status": "done" if ok else "error", "result": last,
-                "error": stderr[:2000] if not ok else None,
-                "stdout": "\n".join(lines[-10:]) if lines else None}
-        return _train_last_result
-    # still running — try to read latest progress line
+            await asyncio.sleep(0.5)
+
+    watcher = asyncio.create_task(_watch_mem())
     try:
-        line = await asyncio.wait_for(_train_proc.stdout.readline(), timeout=0.1)
-        if line:
-            try:
-                return {"status": "running", "progress": json.loads(line.decode())}
-            except Exception:
-                pass
+        await asyncio.wait_for(proc.wait(), timeout=600)
     except asyncio.TimeoutError:
-        pass
-    return {"status": "running"}
+        cancelled = True
+        proc.kill()
+    watcher.cancel()
+    elapsed = time.time() - t0
+    stdout = (await proc.stdout.read()).decode("utf-8", errors="replace") if proc.stdout else ""
+    stderr = (await proc.stderr.read()).decode("utf-8", errors="replace") if proc.stderr else ""
+
+    # cleanup temp dirs
+    try: shutil.rmtree(out_dir, ignore_errors=True)
+    except Exception: pass
+    if dummy_dir is not None:
+        try: shutil.rmtree(dummy_dir, ignore_errors=True)
+        except Exception: pass
+
+    if proc.returncode != 0:
+        # Surface the final exception line (Python tracebacks: "Traceback…"
+        # header is useless; the actual `ExceptionType: message` is the last
+        # non-empty line). Fall back to the tail of stderr if nothing parses.
+        non_empty = [l for l in stderr.splitlines() if l.strip()]
+        exc_line = next(
+            (l.strip() for l in reversed(non_empty)
+             if ":" in l and not l.lstrip().startswith(("File ", "Traceback"))),
+            None,
+        )
+        if not exc_line:
+            exc_line = "\n".join(non_empty[-6:]) if non_empty else "training script failed"
+        # Also dump the full stderr server-side so the user can grep it.
+        print(f"[profile] FAILED (rc={proc.returncode})\n{stderr}", flush=True)
+        raise HTTPException(500, f"profile run failed (rc={proc.returncode}): {exc_line[:400]}")
+
+    # parse the script's final json line for elapsed_s / it_s if present
+    script_elapsed = None; script_it_s = None
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"): continue
+        try:
+            j = json.loads(line)
+            if "elapsed_s" in j: script_elapsed = float(j["elapsed_s"])
+            if "it_s" in j:      script_it_s = float(j["it_s"])
+            break
+        except Exception: continue
+
+    n = max(2, body.n_steps)
+    if script_it_s and script_it_s > 0:
+        ms_per_step = 1000.0 / script_it_s
+    elif script_elapsed and script_elapsed > 0:
+        ms_per_step = script_elapsed * 1000.0 / n
+    else:
+        ms_per_step = elapsed * 1000.0 / n  # fallback: wall clock (includes startup)
+
+    return {
+        "ms_per_step": ms_per_step,
+        "peak_ram_gb": peak_bytes / (1024**3),
+        "wall_sec": elapsed,
+        "n_steps": n,
+        "script_it_s": script_it_s,
+        "stub": False,
+    }
+
+
+# ── auto-captioning ─────────────────────────────────────────────────────────
+from backend import captioner as _cap
+
+CAPTION_MODELS = {
+    "pro":   "google/gemini-3.1-pro-preview",
+    "flash": "google/gemini-3.5-flash",
+}
+
+class CaptionEstimateBody(BaseModel):
+    name: str = ""
+    folder: str | None = None
+    only_uncaptioned: bool = True
+    model: str = "pro"      # "pro" or "flash"
+
+@app.post("/api/lora_data/autocaption/estimate")
+async def autocaption_estimate(body: CaptionEstimateBody):
+    d = _lora_data_folder(body.name, body.folder)
+    scan = _scan_lora_folder(d)
+    files = scan["files"]
+    if body.only_uncaptioned:
+        files = [f for f in files if not f["captioned"]]
+    model = CAPTION_MODELS.get(body.model, CAPTION_MODELS["pro"])
+    est = _cap.estimate_cost(len(files), model=model)
+    return {"n_files": len(files), "model": model, **est}
+
+
+class CaptionStartBody(BaseModel):
+    name: str = ""
+    folder: str | None = None
+    only_uncaptioned: bool = True
+    examples: list[str] | None = None
+    parallel: int = 32
+    model: str = "pro"
+
+
+_caption_task = None
+@app.post("/api/lora_data/autocaption/start")
+async def autocaption_start(body: CaptionStartBody):
+    global _caption_task
+    if _cap.status.running:
+        raise HTTPException(409, "captioning already in progress")
+    api_key = _settings.get("openrouter_api_key", "")
+    if not api_key:
+        raise HTTPException(400, "OpenRouter API key not set in Settings")
+    d = _lora_data_folder(body.name, body.folder)
+    scan = _scan_lora_folder(d)
+    files = [Path(scan["folder"]) / f["name"] for f in scan["files"]
+             if not body.only_uncaptioned or not f["captioned"]]
+    if not files:
+        return {"started": False, "reason": "no files to caption"}
+    examples = body.examples or _cap.DEFAULT_EXAMPLES
+    model = CAPTION_MODELS.get(body.model, CAPTION_MODELS["pro"])
+    parallel = max(1, min(128, int(body.parallel)))
+    # Launch on the running loop in a fire-and-forget task
+    loop = asyncio.get_running_loop()
+    _caption_task = loop.create_task(
+        _cap.run_caption_batch(api_key, Path(scan["folder"]), files, examples,
+                               parallel, model, lora_name=body.name)
+    )
+    return {"started": True, "total": len(files), "parallel": parallel, "model": model}
+
+
+@app.get("/api/lora_data/autocaption/status")
+async def autocaption_status():
+    return _cap.status.snapshot()
+
+
+@app.post("/api/lora_data/autocaption/cancel")
+async def autocaption_cancel():
+    # Flip running=false immediately so the UI clears without waiting for
+    # in-flight requests to drain; the worker pool watches `cancelled` and
+    # short-circuits any new work.
+    _cap.status.cancelled = True
+    _cap.status.running = False
+    return {"cancelled": True}
+
+
+# Persist examples per-folder so the UI can recall the user's edits
+@app.post("/api/lora_data/captioner_examples/get")
+async def captioner_examples_get(body: LoraDataQuery):
+    d = _lora_data_folder(body.name, body.folder)
+    cfg = d.parent / "captioner.json"
+    if cfg.exists():
+        try:
+            j = json.loads(cfg.read_text())
+            return {"examples": j.get("examples") or _cap.DEFAULT_EXAMPLES,
+                    "model":    j.get("model",    "pro"),
+                    "parallel": j.get("parallel", 32)}
+        except Exception: pass
+    return {"examples": _cap.DEFAULT_EXAMPLES, "model": "pro", "parallel": 32}
+
+
+class CaptionerCfgBody(BaseModel):
+    name: str = ""
+    folder: str | None = None
+    examples: list[str]
+    model: str = "pro"
+    parallel: int = 32
+
+@app.post("/api/lora_data/captioner_examples/set")
+async def captioner_examples_set(body: CaptionerCfgBody):
+    d = _lora_data_folder(body.name, body.folder)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    cfg = d.parent / "captioner.json"
+    cfg.write_text(json.dumps({
+        "examples": body.examples, "model": body.model, "parallel": body.parallel,
+    }, indent=2))
+    return {"ok": True}
+
+
+class LoraDataRenameBody(BaseModel):
+    old_name: str
+    new_name: str
+
+
+@app.post("/api/lora_data/rename")
+async def lora_data_rename(body: LoraDataRenameBody):
+    """Rename or load: if dst doesn't exist, move src → dst (so an in-progress
+    `_scratch` becomes a named LoRA, carrying its files). If dst already exists,
+    don't error — just switch to it (load its files), leaving src in place.
+    The frontend treats this as 'change the name field and the dataset follows.'"""
+    if not body.old_name or not body.new_name:
+        raise HTTPException(400, "old_name and new_name required")
+    if "/" in body.new_name or "\\" in body.new_name or body.new_name.startswith("."):
+        raise HTTPException(400, "invalid lora name")
+    if body.old_name == body.new_name:
+        return _scan_lora_folder(_lora_data_folder(body.new_name, None))
+    src = (LORA_TRAIN_DIR / body.old_name).resolve()
+    dst = (LORA_TRAIN_DIR / body.new_name).resolve()
+    if dst.exists():
+        # Switching to an existing LoRA. Don't move src; just return dst's data.
+        return _scan_lora_folder(_lora_data_folder(body.new_name, None))
+    if src.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+    return _scan_lora_folder(_lora_data_folder(body.new_name, None))
+
+
+class LoraDataDeleteBody(BaseModel):
+    name: str = ""
+    folder: str | None = None
+    file: str
+
+
+@app.post("/api/lora_data/delete")
+async def lora_data_delete(body: LoraDataDeleteBody):
+    d = _lora_data_folder(body.name, body.folder)
+    target = d / body.file
+    # guard against path traversal
+    try:
+        target.resolve().relative_to(d.resolve())
+    except ValueError:
+        raise HTTPException(400, "invalid file path")
+    if target.exists():
+        target.unlink()
+    txt = d / (Path(body.file).stem + ".txt")
+    if txt.exists() and txt != target:
+        txt.unlink()
+    return _scan_lora_folder(d)
 
 
 # -------- LoRA training --------
@@ -1290,8 +1639,73 @@ class PreEncodeBody(BaseModel):
 
 _lora_train_proc = None
 _lora_train_last_result = None
+# Continuous stdout drain for the lora-train subprocess. _lora_train_progress
+# holds the latest parseable JSON status line; _lora_train_buf accumulates the
+# full transcript so the completion path can read it without racing the drainer.
+_lora_train_progress: dict = {}
+_lora_train_buf: list[str] = []
+_lora_train_steps_all: list[dict] = []     # full history of step events; survives tab switches
+_lora_train_started_ts: float = 0.0        # wall time when the subprocess was spawned
+_lora_train_reader_task = None
+
+
+async def _drain_lora_train_stream():
+    global _lora_train_progress
+    proc = _lora_train_proc
+    while True:
+        try: line = await proc.stdout.readline()
+        except Exception: return
+        if not line: return
+        text = line.decode("utf-8", errors="replace")
+        _lora_train_buf.append(text)
+        t = text.strip()
+        if t.startswith("{") and t.endswith("}"):
+            try:
+                ev = json.loads(t)
+            except Exception:
+                continue
+            _lora_train_progress = ev
+            # Persist every step event so the frontend can rebuild the chart
+            # history on remount (e.g. after a tab switch).
+            if ev.get("status") == "step":
+                _lora_train_steps_all.append(ev)
+                # Cap so a runaway long run doesn't blow up RAM. 8k step events
+                # ≈ ~500KB; still cheap to ship over a JSON poll.
+                if len(_lora_train_steps_all) > 8000:
+                    del _lora_train_steps_all[:len(_lora_train_steps_all) - 8000]
 _pre_encode_proc = None
 _pre_encode_last_result = None
+# Background-reader state. The reader task drains stdout/stderr lines into
+# these as they arrive; the /status endpoint just snapshots `progress`.
+_pre_encode_progress: dict = {}
+_pre_encode_stdout_buf: list[str] = []
+_pre_encode_stderr_buf: list[str] = []
+_pre_encode_reader_task = None
+
+
+async def _drain_pre_encode_streams():
+    """Continuously read both stdout and stderr from the pre-encoder subprocess.
+    Keeps `_pre_encode_progress` up to date with the latest parseable JSON line."""
+    global _pre_encode_progress
+    proc = _pre_encode_proc
+
+    async def _read_stream(stream, buf, is_stdout):
+        global _pre_encode_progress
+        while True:
+            line = await stream.readline()
+            if not line: return
+            text = line.decode("utf-8", errors="replace")
+            buf.append(text)
+            if is_stdout:
+                t = text.strip()
+                if t.startswith("{") and t.endswith("}"):
+                    try:    _pre_encode_progress = json.loads(t)
+                    except Exception: pass
+
+    await asyncio.gather(
+        _read_stream(proc.stdout, _pre_encode_stdout_buf, True),
+        _read_stream(proc.stderr, _pre_encode_stderr_buf, False),
+    )
 
 @app.post("/api/pre_encode")
 async def start_pre_encode(body: PreEncodeBody):
@@ -1342,6 +1756,12 @@ async def start_pre_encode(body: PreEncodeBody):
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
+    # Reset shared reader state and spawn the drain task.
+    global _pre_encode_progress, _pre_encode_stdout_buf, _pre_encode_stderr_buf, _pre_encode_reader_task
+    _pre_encode_progress = {}
+    _pre_encode_stdout_buf = []
+    _pre_encode_stderr_buf = []
+    _pre_encode_reader_task = asyncio.create_task(_drain_pre_encode_streams())
     return {"status": "started", "name": body.name, "output_dir": output_dir}
 
 
@@ -1355,16 +1775,13 @@ async def pre_encode_status():
             return result
         return {"status": "idle"}
     if _pre_encode_proc.returncode is not None:
-        stdout = (await _pre_encode_proc.stdout.read()).decode()
-        stderr = (await _pre_encode_proc.stderr.read()).decode()
-        lines = [l for l in stdout.strip().split("\n") if l.strip()]
-        last = {}
-        for l in reversed(lines):
-            try:
-                last = json.loads(l)
-                break
-            except Exception:
-                continue
+        # Make sure the reader task has finished draining both streams.
+        if _pre_encode_reader_task is not None:
+            try: await asyncio.wait_for(_pre_encode_reader_task, timeout=2.0)
+            except Exception: pass
+        stdout = "".join(_pre_encode_stdout_buf)
+        stderr = "".join(_pre_encode_stderr_buf)
+        last = dict(_pre_encode_progress) if _pre_encode_progress else {}
         rc = _pre_encode_proc.returncode
         ok = rc == 0
         _pre_encode_proc = None
@@ -1378,16 +1795,31 @@ async def pre_encode_status():
             "error": stderr[:2000] if not ok else None,
         }
         return _pre_encode_last_result
-    try:
-        line = await asyncio.wait_for(_pre_encode_proc.stdout.readline(), timeout=0.1)
-        if line:
-            try:
-                return {"status": "running", "progress": json.loads(line.decode())}
-            except Exception:
-                pass
-    except asyncio.TimeoutError:
-        pass
-    return {"status": "running"}
+    return {"status": "running", "progress": dict(_pre_encode_progress)}
+
+
+@app.post("/api/pre_encode/cancel")
+async def cancel_pre_encode():
+    global _pre_encode_proc
+    if _pre_encode_proc is None or _pre_encode_proc.returncode is not None:
+        return {"cancelled": False, "reason": "not running"}
+    try: _pre_encode_proc.kill()
+    except Exception: pass
+    return {"cancelled": True}
+
+
+class ClearEncodedBody(BaseModel):
+    name: str
+
+@app.post("/api/pre_encode/clear")
+async def clear_encoded(body: ClearEncodedBody):
+    """Delete the cached latents directory for a given lora name."""
+    if not body.name: raise HTTPException(400, "name required")
+    enc_dir = LORA_TRAIN_DIR / body.name / "_encoded"
+    if enc_dir.is_dir():
+        import shutil
+        shutil.rmtree(enc_dir, ignore_errors=True)
+    return {"cleared": True, "name": body.name}
 
 
 @app.get("/api/lora_training/{name}/has_encoded")
@@ -1412,9 +1844,8 @@ async def start_lora_training(body: TrainLoraBody):
     output_dir = str(LORA_TRAIN_DIR / body.name)
     LORA_TRAIN_DIR.mkdir(parents=True, exist_ok=True)
 
-    model_name = "medium-base"
-    if _current_model and "small" in _current_model:
-        model_name = _current_model
+    # Train against whatever model is currently loaded (defaults to medium).
+    model_name = _current_model or "medium"
 
     # unload inference model to free VRAM for training
     _training_unloaded_model = _current_model
@@ -1502,6 +1933,12 @@ async def start_lora_training(body: TrainLoraBody):
         stderr=asyncio.subprocess.STDOUT,
         env=env,
     )
+    global _lora_train_progress, _lora_train_buf, _lora_train_steps_all, _lora_train_started_ts, _lora_train_reader_task
+    _lora_train_progress = {}
+    _lora_train_buf = []
+    _lora_train_steps_all = []
+    _lora_train_started_ts = time.time()
+    _lora_train_reader_task = asyncio.create_task(_drain_lora_train_stream())
     return {"status": "started", "name": body.name, "output_dir": output_dir,
             "batch_size": batch_size, "optimizer_steps": optimizer_steps,
             "backend": "mlx" if use_mlx_train else "cuda"}
@@ -1517,27 +1954,20 @@ async def lora_train_status():
             return result
         return {"status": "idle"}
     if _lora_train_proc.returncode is not None:
-        stdout = (await _lora_train_proc.stdout.read()).decode()
-        stderr = ""
-        lines = [l for l in stdout.strip().split("\n") if l.strip()]
-        last = {}
-        for l in reversed(lines):
-            try:
-                last = json.loads(l)
-                break
-            except Exception:
-                continue
+        if _lora_train_reader_task is not None:
+            try: await asyncio.wait_for(_lora_train_reader_task, timeout=2.0)
+            except Exception: pass
+        stdout = "".join(_lora_train_buf)
+        lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+        last = dict(_lora_train_progress) if _lora_train_progress else {}
         rc = _lora_train_proc.returncode
         ok = rc == 0
         _lora_train_proc = None
         if not ok:
             print(f"[lora_train] FAILED (rc={rc})")
-            if stderr:
-                print(f"[lora_train] stderr: {stderr[:2000]}")
-            if stdout:
-                err_lines = [l for l in lines if "error" in l.lower() or "traceback" in l.lower() or "exception" in l.lower()]
-                print(f"[lora_train] stdout errors: {err_lines[-3:] if err_lines else lines[-5:]}")
-        error_detail = stderr[:2000] if stderr else "\n".join(lines[-10:]) if not ok else None
+            err_lines = [l for l in lines if "error" in l.lower() or "traceback" in l.lower() or "exception" in l.lower()]
+            print(f"[lora_train] stdout errors: {err_lines[-3:] if err_lines else lines[-5:]}")
+        error_detail = "\n".join(lines[-10:]) if not ok else None
         _lora_train_last_result = {
             "status": "done" if ok else "error",
             "result": last,
@@ -1556,17 +1986,25 @@ async def lora_train_status():
                 _lora_train_last_result["model_reloaded"] = False
                 _lora_train_last_result["reload_error"] = str(e)
         return _lora_train_last_result
-    # still running
-    try:
-        line = await asyncio.wait_for(_lora_train_proc.stdout.readline(), timeout=0.1)
-        if line:
-            try:
-                return {"status": "running", "progress": json.loads(line.decode())}
-            except Exception:
-                pass
-    except asyncio.TimeoutError:
-        pass
-    return {"status": "running"}
+    # Still running. We ship the FULL step history so a remount (tab switch /
+    # refresh) can rebuild charts in one shot. ~8k events caps at ~500KB.
+    body = {
+        "status": "running",
+        "progress": dict(_lora_train_progress),
+        "steps_all": list(_lora_train_steps_all),
+        "started_ts": _lora_train_started_ts,
+    }
+    return body
+
+
+@app.post("/api/train_lora/cancel")
+async def lora_train_cancel():
+    global _lora_train_proc
+    if _lora_train_proc is None or _lora_train_proc.returncode is not None:
+        return {"cancelled": False, "reason": "not running"}
+    try: _lora_train_proc.kill()
+    except Exception: pass
+    return {"cancelled": True}
 
 
 VALID_MODELS = {"medium", "medium-base", "small-music", "small-sfx"}

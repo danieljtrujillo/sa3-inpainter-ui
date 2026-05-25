@@ -20,6 +20,7 @@ dependencies = [
     "transformers>=5.9.0",
     "uvicorn>=0.47.0",
     "stable-audio-3",
+    "aiohttp>=3.10",
 ]
 
 [project.optional-dependencies]

@@ -160,8 +160,9 @@ def train(args):
     )
 
     lora_dir = Path(__file__).resolve().parent
-    if str(lora_dir) not in sys.path:
-        sys.path.insert(0, str(lora_dir.parent))
+    parent = str(lora_dir.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
     from mlx_sa3.lora import (
         inject_lora,
         freeze_base_unfreeze_lora,
@@ -349,15 +350,25 @@ def train(args):
         loss_val = float(loss)
         running_loss = 0.95 * running_loss + 0.05 * loss_val if step > 1 else loss_val
 
-        if step % 10 == 0 or step == 1:
-            elapsed = time.time() - t0
-            it_s = step / elapsed if elapsed > 0 else 0
-            _log({
-                "status": "step", "step": step,
-                "loss": round(loss_val, 6),
-                "avg_loss": round(running_loss, 6),
-                "it_s": round(it_s, 2),
-            })
+        # Compute global grad L2 norm across all trainable params for the
+        # chart. Flatten the grads tree, square+sum each leaf, sqrt at the end.
+        gnorm_sq = mx.array(0.0)
+        for _, g in nn.utils.tree_flatten(grads):
+            if g is not None:
+                gnorm_sq = gnorm_sq + mx.sum(g * g)
+        gnorm = float(mx.sqrt(gnorm_sq))
+
+        # Emit per-step so the frontend sparklines update in real-time. The
+        # backend's continuous drainer buffers these into a queue between polls.
+        elapsed = time.time() - t0
+        it_s = step / elapsed if elapsed > 0 else 0
+        _log({
+            "status": "step", "step": step,
+            "loss": round(loss_val, 6),
+            "avg_loss": round(running_loss, 6),
+            "grad_norm": round(gnorm, 6),
+            "it_s": round(it_s, 2),
+        })
 
         if step % args.checkpoint_every == 0 or step == args.steps:
             ckpt_path_st = save_dir / f"lora-step{step:06d}.safetensors"
