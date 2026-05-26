@@ -14,6 +14,13 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
+# AMD/ROCm tuning — must be set before `import torch`. TunableOp auto-tunes
+# GEMM kernel selection on first use and caches to disk; the BLAS preference
+# picks hipBLASLt for fused fast paths. Both are no-ops on CUDA/MPS, so it's
+# safe to leave on everywhere. Ported from mateo19182/sa3-inpainter-ui.
+os.environ.setdefault("PYTORCH_TUNABLEOP_ENABLED", "1")
+os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
+
 import numpy as np
 import torch
 import soundfile as sf
@@ -165,6 +172,35 @@ _use_fp16 = os.environ.get("SA3_FP16", "0") == "1"
 _cancel_event = threading.Event()
 _loaded_lora_name = None
 _default_memory_tokens = None   # snapshot of original memory tokens
+
+# Conditioning cache — skips T5/Gemma re-encoding (~1-2s) when the same prompt
+# is used across multiple inpaint / vary calls. Ported from mateo19182's fork.
+# Cleared on model swap (different conditioner) and LoRA changes (different
+# conditioner weights when conditioner LoRA is loaded).
+_cond_cache: dict = {}
+_COND_CACHE_MAX = 8
+
+def _clear_cond_cache():
+    global _cond_cache
+    _cond_cache = {}
+
+def _get_conditioning(prompt: str, neg_prompt: str | None, duration: float):
+    """Return (pos_copy, neg_copy_or_None, was_cached). Shallow-copies before
+    returning so generate() can mutate the dicts (it adds inpaint_mask /
+    inpaint_masked_input) without corrupting the cached originals."""
+    if sa is None:
+        return None, None, False
+    key = (prompt, neg_prompt or "", round(duration, 2))
+    was_cached = key in _cond_cache
+    if not was_cached:
+        pos_cond, neg_cond = sa._build_conditioning_dicts(prompt, neg_prompt, duration, 1)
+        pos_tensors = sa.model.conditioner(pos_cond, DEVICE)
+        neg_tensors = sa.model.conditioner(neg_cond, DEVICE) if neg_cond is not None else None
+        if len(_cond_cache) >= _COND_CACHE_MAX:
+            _cond_cache.pop(next(iter(_cond_cache)))
+        _cond_cache[key] = (pos_tensors, neg_tensors)
+    pos, neg = _cond_cache[key]
+    return dict(pos), (dict(neg) if neg is not None else None), was_cached
 _memory_token_strength = 1.0    # user-controllable scale factor
 _training_unloaded_model = None # model name to reload after training
 
@@ -178,6 +214,7 @@ def _load_model(name, local_path=None):
     mlx_ae = None
     _use_mlx_ae = False
     _loaded_lora_name = None
+    _clear_cond_cache()
     gc.collect()
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -430,6 +467,9 @@ def _apply_loras(loras: list[dict]) -> None:
         if _loaded_lora_name != name:
             sa.load_lora([str(lora_path)])
             _loaded_lora_name = name
+            # Conditioner-side LoRA may alter T5/Gemma — drop any cached
+            # encodings so the next call recomputes them.
+            _clear_cond_cache()
             print(f"[lora] loaded {name}")
         sa.set_lora_strength(strength)
         print(f"[lora] strength {name} @ {strength}")
@@ -484,6 +524,37 @@ async def redetect_bpm():
 class LoraEntry(BaseModel):
     name: str
     strength: float = 1.0
+
+
+# ---- Prompt enhancer (SA3's bundled Qwen3.5-2B reprompter) ----
+# Loaded lazily on first call — ~4.2GB download then BF16 in unified memory.
+
+_ENHANCER_MODEL_ID = "Qwen/Qwen3.5-2B"
+
+class EnhancePromptBody(BaseModel):
+    prompt: str = ""
+    preset: str = "Auto"           # "Auto" | "Music" | "Instrument" | "SFX" | "Classifier"
+    max_new_tokens: int = 128
+    temperature: float = 1.11
+
+@app.post("/api/enhance_prompt")
+async def enhance_prompt(body: EnhancePromptBody):
+    """Wraps stable_audio_3.interface.reprompt.reprompt(...).
+    Empty input returns a random example from the Music system prompt."""
+    try:
+        from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn
+    except Exception as e:
+        raise HTTPException(500, f"prompt enhancer unavailable: {e}")
+    def _run():
+        return _reprompt_fn(
+            body.prompt, body.preset, "",
+            _ENHANCER_MODEL_ID, body.max_new_tokens, body.temperature,
+        )
+    try:
+        raw, processed, category = await asyncio.to_thread(_run)
+    except Exception as e:
+        raise HTTPException(500, f"enhance failed: {e}")
+    return {"prompt": processed or raw or body.prompt, "raw": raw, "category": category}
 
 
 class GenBody(BaseModel):
@@ -588,11 +659,35 @@ async def generate(body: GenBody):
     print(f"[generate] source={has_source} mask_len={len(body.mask) if body.mask else 0} regen_latents={n_regen} mode={('inpaint' if has_source and has_mask else 'vary' if has_source else 't2a')}")
 
     neg_prompt = body.negative_prompt or None
-    kwargs = dict(prompt=body.prompt, negative_prompt=neg_prompt, steps=steps,
-                  cfg_scale=cfg, seed=seed, apg_scale=apg_scale,
+    # Conditioning cache: skip T5/Gemma re-encoding (~1-2s) when the same prompt
+    # repeats. Cache key is (prompt, neg, file_duration), so multiple inpaints
+    # against the same track hit the cache. Falls back to None tensors if
+    # encoding fails for any reason — sa.generate() will then re-encode itself.
+    eff_duration = duration
+    if has_source and state["audio_path"]:
+        try:
+            info = sf.info(state["audio_path"])
+            eff_duration = info.frames / info.samplerate
+        except Exception:
+            pass
+    t_cond = time.time()
+    try:
+        pos_cond, neg_cond, was_cached = _get_conditioning(body.prompt, neg_prompt, eff_duration)
+        print(f"[backend] conditioning {'(cached)' if was_cached else '(encoded)'} {time.time()-t_cond:.2f}s")
+    except Exception as e:
+        print(f"[backend] conditioning cache miss → falling back to prompt path: {e}")
+        pos_cond, neg_cond = None, None
+    kwargs = dict(steps=steps, cfg_scale=cfg, seed=seed, apg_scale=apg_scale,
                   duration_padding_sec=duration_padding_sec,
                   return_latents=True,
                   chunked_decode=False)
+    if pos_cond is not None:
+        kwargs["conditioning_tensors"] = pos_cond
+        if neg_cond is not None:
+            kwargs["negative_conditioning_tensors"] = neg_cond
+    else:
+        kwargs["prompt"] = body.prompt
+        kwargs["negative_prompt"] = neg_prompt
     if sampler_type:
         kwargs["sampler_type"] = sampler_type
     if dist_shift is not None:

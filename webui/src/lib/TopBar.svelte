@@ -28,6 +28,7 @@ function onSave() {
 const tabs = [
   { id: "inpainter", label: "Inpainter" },
   { id: "trainer",   label: "LoRA Trainer" },
+  { id: "browser",   label: "Browser" },
   { id: "settings",  label: "Settings" },
 ];
 </script>

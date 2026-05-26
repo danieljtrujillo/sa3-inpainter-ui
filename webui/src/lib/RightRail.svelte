@@ -1,6 +1,21 @@
 <script>
-import { session, apiGenerate, cancelGenerate, apiSwitchModel, apiTempo, apiRedetectBpm, apiMemtokInfo, apiMemtokSet, apiMemtokAction, apiDecodeSettings, apiSetDecodeSettings } from "./session.svelte.js";
+import { session, apiGenerate, cancelGenerate, apiSwitchModel, apiTempo, apiRedetectBpm, apiMemtokInfo, apiMemtokSet, apiMemtokAction, apiDecodeSettings, apiSetDecodeSettings, apiEnhancePrompt } from "./session.svelte.js";
+import { toasts } from "./toast.svelte.js";
 import Panel from "./Panel.svelte";
+
+let enhancing = $state(false);
+async function enhancePrompt() {
+  if (enhancing) return;
+  enhancing = true;
+  try {
+    const j = await apiEnhancePrompt(session.prompt);
+    if (j && j.prompt) session.prompt = j.prompt;
+  } catch (e) {
+    toasts.error("Prompt enhance failed: " + e.message);
+  } finally {
+    enhancing = false;
+  }
+}
 
 let promptCharCount = $derived(session.prompt.length);
 
@@ -150,12 +165,11 @@ $effect(() => {
           <i class="bi bi-magic"></i> {ctaLabel}
         {/if}
       </button>
-      {#if !session.generating && session.hasAudio}
-        <button class="btn btn-ghost btn-square" onclick={rerollGenerate}
-                title="Re-roll: run the same generation again with a new random seed">
-          <i class="bi bi-dice-5"></i>
-        </button>
-      {/if}
+      <button class="btn btn-ghost btn-square" onclick={enhancePrompt}
+              disabled={enhancing}
+              title="Enhance prompt with SA3's bundled Qwen3.5-2B reprompter. Empty prompt → random example. First call downloads ~4.2GB.">
+        <i class="bi {enhancing ? 'bi-hourglass-split' : 'bi-feather'}"></i>
+      </button>
     {/if}
     {#if !ctaVisible && !session.generating}
       <div class="cta-hint">paint latents or raise A2A noise to generate</div>

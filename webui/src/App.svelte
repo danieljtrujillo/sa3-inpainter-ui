@@ -11,6 +11,7 @@ import Toast from "./lib/Toast.svelte";
 import HelpOverlay from "./lib/HelpOverlay.svelte";
 import SettingsView from "./lib/SettingsView.svelte";
 import TrainerView from "./lib/TrainerView.svelte";
+import BrowserView from "./lib/BrowserView.svelte";
 
 let audioEl = $state(null);
 let isDragOver = $state(false);
@@ -278,6 +279,8 @@ onMount(() => {
     </main>
   {:else if session.activeTab === "trainer"}
     <main class="single-pane"><TrainerView /></main>
+  {:else if session.activeTab === "browser"}
+    <main class="single-pane"><BrowserView /></main>
   {:else if session.activeTab === "settings"}
     <main class="single-pane"><SettingsView /></main>
   {/if}

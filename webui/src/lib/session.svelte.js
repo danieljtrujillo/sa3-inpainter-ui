@@ -418,11 +418,13 @@ export async function apiGenerate() {
     if (j.bpm != null) session.bpm = j.bpm;
     if (j.seed != null) session.lastSeed = j.seed;
     session.pushVariant();
-    // remember the inpainted regions as ghost (visual recall), then clear the live mask
+    // Remember the inpainted regions as ghost (visual recall) AND keep the
+    // live mask exactly where it was, so the user can re-roll the same
+    // selection with a different seed / prompt / cfg without having to
+    // re-paint. Esc / "Clear mask" still clears it explicitly.
     if (body.mask.some((v) => v)) {
       session.ghostMask = new Uint8Array(body.mask);
     }
-    session.mask = new Uint8Array(session.mask.length);
     session.pushAudioMarker();
     session.canUndo = true;
     session.canRedo = false;
@@ -653,6 +655,10 @@ export async function apiCancelPreEncode() {
 
 export async function apiCancelLoraTrain() {
   return _postJson("/api/train_lora/cancel", {});
+}
+
+export async function apiEnhancePrompt(prompt, preset = "Auto") {
+  return _postJson("/api/enhance_prompt", { prompt, preset });
 }
 
 export async function apiGetTrainSettings(name) {
